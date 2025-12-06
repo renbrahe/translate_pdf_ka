@@ -1,0 +1,6 @@
+openai>=1.60.0
+
+# Для локальной модели перевода (Helsinki-NLP/opus-mt-ka-ru / ka-en)
+transformers>=4.46.0
+torch>=2.3.0
+sentencepiece>=0.2.0
