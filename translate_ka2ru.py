@@ -390,6 +390,72 @@ def apply_translations_docx(
 
     print(f"💾 DOCX сохранён: {output_path}, изменённых XML: {changed}")
 
+def apply_translations_xlsx(
+    input_path: str,
+    output_path: str,
+    text_mapping: Dict[str, str],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    start: float = 90.0,
+    end: float = 100.0,
+) -> None:
+    """
+    Безопасно применяет переводы к XLSX через openpyxl.
+
+    text_mapping: {исходный_грузинский_текст_strip -> перевод}
+
+    Логика:
+      - открываем книгу через openpyxl;
+      - для всех ячеек со строковым значением:
+          * берём value;
+          * делаем stripped = value.strip();
+          * если stripped есть в text_mapping — подменяем, аккуратно сохраняя
+            ведущие/хвостовые пробелы;
+      - сохраняем в output_path.
+    """
+    from openpyxl import load_workbook
+
+    # Открываем книгу
+    wb = load_workbook(input_path, data_only=False)
+
+    # Считаем общее число ячеек для более-менее честного прогресса
+    total_cells = 0
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            total_cells += len(row)
+    if total_cells == 0:
+        total_cells = 1  # защита от деления на ноль
+
+    processed = 0
+    changed_cells = 0
+
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                val = cell.value
+                if isinstance(val, str):
+                    original = val
+                    stripped = val.strip()
+                    if stripped in text_mapping:
+                        new_core = text_mapping[stripped]
+
+                        # сохраняем ведущие/хвостовые пробелы
+                        prefix_len = len(original) - len(original.lstrip())
+                        suffix_len = len(original) - len(original.rstrip())
+                        prefix = original[:prefix_len]
+                        suffix = original[len(original) - suffix_len:] if suffix_len > 0 else ""
+
+                        cell.value = f"{prefix}{new_core}{suffix}"
+                        changed_cells += 1
+
+                processed += 1
+                if progress_callback:
+                    frac = processed / total_cells
+                    pct = start + (end - start) * frac
+                    progress_callback(pct, "Применение перевода в XLSX...")
+
+    wb.save(output_path)
+    print(f"💾 XLSX сохранён: {output_path}, изменённых ячеек: {changed_cells}")
+
 
 
 # ============ Переводчики ============
