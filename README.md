@@ -55,11 +55,3 @@
 - Прочее:
   - `re`, `json`, `os`, `threading`, `typing` — стандартная библиотека
 
-Рекомендуется оформить зависимости в `requirements.txt`, например (упрощённый вариант):
-
-```text
-openai
-openpyxl
-transformers
-torch
-sentencepiece
