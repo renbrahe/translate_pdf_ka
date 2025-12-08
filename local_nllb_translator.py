@@ -20,7 +20,7 @@ def translate_with_nllb_ka_en(
 ) -> Dict[str, str]:
     """
     Локальный перевод грузинский → английский с упором на качество
-    через facebook/nllb-200-distilled-600M.
+    через facebook/nllb-200-distilled-1.3B.
 
     Требуется:
       pip install transformers torch sentencepiece
@@ -28,7 +28,7 @@ def translate_with_nllb_ka_en(
     ВНИМАНИЕ: модель тяжёлая, на CPU i3 будет очень медленно.
     """
 
-    MODEL_NAME = "facebook/nllb-200-distilled-600M"
+    MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
     SRC_LANG = "kat_Geor"   # грузинский
     TGT_LANG = "eng_Latn"   # английский
 

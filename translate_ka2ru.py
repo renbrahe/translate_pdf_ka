@@ -10,12 +10,9 @@ from typing import Dict, List, Set, Iterable, Callable, Optional
 
 import xml.etree.ElementTree as ET
 
-from transformers import MarianMTModel, MarianTokenizer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 
-from local_nllb_translator import translate_with_nllb_ka_en
-from local_qwen_mt import QwenLocalTranslator
 
 # ============ Настройки по умолчанию ============
 
@@ -35,15 +32,14 @@ DIRECTION_CONFIG: Dict[str, Dict[str, str]] = {
         "label": "Грузинский → Русский",
         "target_language": "Russian",
         "suffix": "_ru",
-        "local_model": "NLLB-200-ka-ru",
     },
     "ka-en": {
         "label": "Грузинский → Английский",
         "target_language": "English",
         "suffix": "_en",
-        "local_model": "NLLB-200-ka-en",
     },
 }
+
 
 # диапазоны Unicode для грузинского
 GEORGIAN_RE = re.compile(r"[\u10A0-\u10FF\u1C90-\u1CBF]+")
@@ -817,63 +813,116 @@ def translate_with_local_model(
     end: float = 90.0,
 ) -> Dict[str, str]:
     """
-    Локальный перевод через LLM Qwen2.5-Instruct.
+    Универсальный ЛОКАЛЬНЫЙ переводчик на основе NLLB-200 (1.3B или distilled-1.3B).
 
-    Сейчас:
-      - ka-ru: Georgian -> Russian (через Qwen промптом)
-      - ka-en: Georgian -> English (через Qwen промптом)
+    Поддерживает любые направления:
+        ka-ru: грузинский → русский
+        ka-en: грузинский → английский
+        ka-xx: грузинский → любой язык (если добавить в LANG_MAP)
 
-    Вся остальная логика (DOCX/XLSX, маппинг по абзацам) остаётся прежней.
+    Требует пакетов:
+        pip install transformers sentencepiece torch
     """
 
-    if progress_callback is None:
-        def progress_callback(pct: float, msg: str) -> None:
-            pass  # type: ignore
+    # Языковые коды NLLB для BOS токена
+    LANG_MAP = {
+        "ka": "kat_Geor",
+        "ru": "rus_Cyrl",
+        "en": "eng_Latn",
+        # при необходимости расширишь таблицу:
+        # "de": "deu_Latn",
+        # "fr": "fra_Latn",
+    }
 
-    # фильтруем вход
-    remaining = [f for f in fragments if isinstance(f, str) and f.strip()]
+    # -------------------------------
+    # Разбор direction_code = "ka-ru"
+    # -------------------------------
+    if "-" not in direction_code:
+        raise ValueError(f"direction_code должен быть формата ka-ru, а получено: {direction_code}")
+
+    src, tgt = direction_code.split("-")
+
+    if src not in LANG_MAP:
+        raise ValueError(f"Источник языка '{src}' не поддержан в LANG_MAP")
+
+    if tgt not in LANG_MAP:
+        raise ValueError(f"Целевой язык '{tgt}' не поддержан в LANG_MAP")
+
+    SRC_LANG = LANG_MAP[src]
+    TGT_LANG = LANG_MAP[tgt]
+
+    # -----------------------------------------
+    # Подготовка входных фрагментов
+    # -----------------------------------------
+    remaining = [f.strip() for f in fragments if isinstance(f, str) and f.strip()]
     if not remaining:
         return {}
 
-    # Определяем языки по direction_code
-    if direction_code == "ka-ru":
-        src_lang = "Georgian"
-        tgt_lang = "Russian"
-    elif direction_code == "ka-en":
-        src_lang = "Georgian"
-        tgt_lang = "English"
-    else:
-        raise ValueError(f"Для локальной LLM-переводчика пока не поддержано направление: {direction_code}")
+    # -----------------------------------------
+    # Выбор модели NLLB (1.3B или distilled-1.3B)
+    # -----------------------------------------
+    # Самая качественная:  facebook/nllb-200-1.3B
+    # Быстрее и легче:    facebook/nllb-200-distilled-1.3B
+    MODEL_NAME = "facebook/nllb-200-3.3B"
 
-    MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"  # 3B реалистичнее на CPU
-    print(f"⏳ Загружаем локальную LLM Qwen ({MODEL_NAME}) для {direction_code} ({src_lang}→{tgt_lang})...")
-    progress_callback(start, f"Загрузка локальной LLM Qwen ({src_lang}→{tgt_lang})...")
+    print(f"⏳ Загружаем локальную NLLB модель: {MODEL_NAME}")
+    if progress_callback:
+        progress_callback(start, f"Загрузка локальной модели NLLB ({MODEL_NAME})…")
 
-    # один инстанс на вызов; при необходимости можно закэшировать глобально
-    translator = QwenLocalTranslator(
-        model_name=MODEL_NAME,
-        dtype=torch.float32 if not torch.cuda.is_available() else torch.float16,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SRC_LANG)
+    device = torch.device("cpu")
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    model.eval()
+
+    # -----------------------------------------
+    # Параметры батчинга
+    # -----------------------------------------
+    BATCH_SIZE = 1  # для 1.3B/distilled-1.3B на слабом CPU лучше начинать с 1
+    MAX_TOKENS = 256
 
     total = len(remaining)
-    print(f"Для Qwen локального перевода подготовлено {total} фрагментов.")
+    done = 0
+    mapping: Dict[str, str] = {}
 
-    # На CPU ставим batch_size=1 (LLM тяжёлая); на GPU можно 2+
-    if translator.device == "cpu":
-        batch_size = 1
-    else:
-        batch_size = 2
+    # -----------------------------------------
+    # Основной цикл перевода
+    # -----------------------------------------
+    for i, batch in enumerate(chunks(remaining, BATCH_SIZE), start=1):
+        print(f"--> [NLLB {direction_code}] batch {i}, size={len(batch)}")
 
-    mapping = translator.translate(
-        fragments=remaining,
-        src_lang=src_lang,
-        tgt_lang=tgt_lang,
-        batch_size=batch_size,
-        max_new_tokens=256,  # можно поднять до 512, но будет медленнее
-        progress_callback=progress_callback,
-        start=start,
-        end=end,
-    )
+        inputs = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        # получаем id языкового токена для BOS
+        bos_id = tokenizer.convert_tokens_to_ids(TGT_LANG)
+        if bos_id is None:
+            raise RuntimeError(f"Не удалось получить token id для языка {TGT_LANG}")
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                forced_bos_token_id=bos_id,
+                max_length=MAX_TOKENS,
+            )
+
+        outputs = tokenizer.batch_decode(generated, skip_special_tokens=True)
+
+        for orig, trans in zip(batch, outputs):
+            trans = (trans or "").strip()
+            mapping[orig] = trans if trans else orig
+
+        done += len(batch)
+        if progress_callback and total > 0:
+            pct = start + (end - start) * (done / total)
+            progress_callback(pct, f"Перевод локальной моделью (NLLB, {direction_code})…")
+
+        print(f"   [NLLB {direction_code}] готово {done}/{total}")
 
     return mapping
 
@@ -1153,7 +1202,7 @@ class TranslatorGUI:
 
         r2 = ttk.Radiobutton(
             frm,
-            text="Локальная модель (Helsinki-NLP)",
+            text="Локальная модель (NLLB-200)",
             variable=self.translator_var,
             value="local",
             command=self.on_translator_change,
