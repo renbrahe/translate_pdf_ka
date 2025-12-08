@@ -279,12 +279,12 @@ def process_docx_xml_paragraphs(
 
         translated_clean = id_mapping[para_id]
 
-        # дебаг — как у тебя
-        print("\n=== RAW TRANSLATION BEFORE SPLIT ===")
-        print("ID:", para_id)
-        print("ORIGINAL:", repr(orig_full))
-        print("TRANSLATED:", repr(translated_clean))
-        print("====================================\n")
+        # дебаг
+        #print("\n=== RAW TRANSLATION BEFORE SPLIT ===")
+        #print("ID:", para_id)
+        #print("ORIGINAL:", repr(orig_full))
+        #print("TRANSLATED:", repr(translated_clean))
+        #print("====================================\n")
 
         # сохраняем ведущие/хвостовые пробелы абзаца
         lead = len(orig_full) - len(orig_full.lstrip())
