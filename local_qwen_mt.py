@@ -7,6 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def default_chunks(lst: List[str], n: int) -> Iterable[List[str]]:
+    """Простая нарезка списка на чанки по n элементов."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
@@ -14,19 +15,25 @@ def default_chunks(lst: List[str], n: int) -> Iterable[List[str]]:
 class QwenLocalTranslator:
     """
     Локальный переводчик на базе Qwen2.5-Instruct (LLM).
-    Работает через диалоговый промпт: даём список фрагментов и просим вернуть JSON.
+
+    Работает через диалоговый промпт:
+      - даём system + user сообщения,
+      - user содержит JSON с фрагментами для перевода,
+      - модель должна вернуть JSON с переведёнными фрагментами.
+
+    Основной публичный метод: translate(...)
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-7B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
         device: Optional[str] = None,
         dtype: torch.dtype = torch.float16,
     ):
         """
-        model_name: имя модели на Hugging Face
-        device: "cuda" / "cpu"; по умолчанию auto
-        dtype: тип тензоров (fp16 для экономии памяти на GPU; на CPU всё равно будет медленно)
+        model_name: имя модели на Hugging Face (например, "Qwen/Qwen2.5-7B-Instruct")
+        device: "cuda" / "cpu"; если None — auto: cuda если доступна, иначе cpu
+        dtype: тип тензоров для GPU (на CPU принудительно используем float32)
         """
 
         if device is None:
@@ -36,30 +43,40 @@ class QwenLocalTranslator:
 
         print(f"⏳ Загружаем Qwen-модель: {model_name} (device={device})...")
 
-        # токенайзер
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # Токенайзер Qwen (часто требует trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
 
-        # без bitsandbytes и 4bit, просто обычная модель
+        # Модель Qwen
+        # На GPU можно использовать dtype (fp16/bf16),
+        # на CPU — всегда float32 (иначе могут быть странности и креши).
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype=dtype if device == "cuda" else torch.float32,
-        )
+            trust_remote_code=True,
+        ).to(device)
 
-        # переводим на нужное устройство
-        self.model = self.model.to(device)
         self.model.eval()
-
         print("✅ Qwen-модель загружена.")
+
+    # ==========================
+    # Построение промпта и вызов модели
+    # ==========================
 
     @staticmethod
     def _build_system_prompt(src_lang: str, tgt_lang: str) -> str:
+        """
+        System-prompt: объясняем модели задачу и формат ответа (JSON).
+        """
         return (
             "You are a professional legal and technical translator.\n"
             f"Translate the given text fragments from {src_lang} to {tgt_lang}.\n"
             "Return ONLY a valid JSON object with the following structure:\n"
             "{\n"
-            '  "translations": [\n'
-            '    {"id": <int>, "text": "<translation text>"},\n'
+            '  \"translations\": [\n'
+            '    {\"id\": <int>, \"text\": \"<translation text>\"},\n'
             "    ...\n"
             "  ]\n"
             "}\n"
@@ -72,6 +89,14 @@ class QwenLocalTranslator:
 
     @staticmethod
     def _build_user_payload(items: List[Tuple[int, str]], src_lang: str, tgt_lang: str) -> str:
+        """
+        Формирует JSON-пейлоад для user-сообщения:
+        {
+          "source_language": "...",
+          "target_language": "...",
+          "items": [{"id": 0, "text": "..."}, ...]
+        }
+        """
         import json
         payload = {
             "source_language": src_lang,
@@ -80,10 +105,16 @@ class QwenLocalTranslator:
         }
         return json.dumps(payload, ensure_ascii=False)
 
-    def _call_model_raw(self, system_prompt: str, user_content: str, max_new_tokens: int = 512) -> str:
+    def _call_model_raw(
+        self,
+        system_prompt: str,
+        user_content: str,
+        max_new_tokens: int = 512,
+    ) -> str:
         """
-        Один прямой вызов LLM (Qwen) в формате chat: system + user → assistant.
-        Возвращает сырую строку ответа модели.
+        Один прямой вызов Qwen в chat-формате:
+        system + user → assistant.
+        Возвращает сырую строку ответа (обычно JSON).
         """
         tokenizer = self.tokenizer
         model = self.model
@@ -93,6 +124,7 @@ class QwenLocalTranslator:
             {"role": "user", "content": user_content},
         ]
 
+        # Qwen умеет применять chat-шаблон:
         input_ids = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -103,32 +135,37 @@ class QwenLocalTranslator:
             output_ids = model.generate(
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,   # детерминированно
+                do_sample=False,   # детерминированный вывод
                 num_beams=1,
             )
 
+        # Откусываем сгенерированную часть (после входного промпта)
         gen_ids = output_ids[0, input_ids.shape[-1]:]
         text = tokenizer.decode(gen_ids, skip_special_tokens=True)
         return text.strip()
+
+    # ==========================
+    # Парсинг JSON-ответа
+    # ==========================
 
     @staticmethod
     def _parse_json_response(raw: str) -> Dict[int, str]:
         """
         Парсит JSON вида:
-        {"translations":[{"id":0,"text":"..."}, ...]}
-        Возвращает {id: text}.
+          {"translations":[{"id":0,"text":"..."}, ...]}
+        Возвращает словарь {id: text}.
         """
         import json
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Попытка вырезать JSON
+            # Попытка вырезать JSON из более "грязного" ответа
             start = raw.find("{")
             end = raw.rfind("}")
             if start != -1 and end != -1 and end > start:
                 try:
-                    data = json.loads(raw[start : end + 1])
+                    data = json.loads(raw[start: end + 1])
                 except json.JSONDecodeError:
                     raise ValueError(f"Невозможно распарсить JSON из ответа модели:\n{raw}")
             else:
@@ -153,6 +190,10 @@ class QwenLocalTranslator:
 
         return result
 
+    # ==========================
+    # Публичный метод перевода
+    # ==========================
+
     def translate(
         self,
         fragments: List[str],
@@ -167,15 +208,27 @@ class QwenLocalTranslator:
     ) -> Dict[str, str]:
         """
         Основной метод перевода:
-        - dedup фрагментов,
-        - режем на батчи и шлём в Qwen,
-        - собираем mapping {оригинал -> перевод}.
+
+        - чистит и дедуплицирует фрагменты;
+        - для уникальных текстов создаёт числовые id;
+        - режет на батчи и шлёт в Qwen;
+        - собирает mapping {оригинал -> перевод}.
+
+        fragments: список исходных строк (грузинский текст и т.п.)
+        src_lang: "Georgian"
+        tgt_lang: "Russian" / "English" и т.д.
+        batch_size: размер батча (на CPU лучше 1, максимум 2)
+        max_new_tokens: максимум токенов, которые модель может сгенерировать сверх входа
+        progress_callback: функция для прогресса (pct, msg)
+        start, end: диапазон процентов прогресса для этого этапа
         """
+
         if progress_callback is None:
             def progress_callback(p, m):  # type: ignore
                 pass
 
-        cleaned = []
+        # 1. Чистим и убираем пустые
+        cleaned: List[str] = []
         for f in fragments:
             if isinstance(f, str):
                 s = f.strip()
@@ -185,6 +238,7 @@ class QwenLocalTranslator:
         if not cleaned:
             return {}
 
+        # 2. Дедупликация уникальных текстов
         unique_texts: List[str] = []
         seen = set()
         for s in cleaned:
@@ -201,12 +255,18 @@ class QwenLocalTranslator:
 
         system_prompt = self._build_system_prompt(src_lang, tgt_lang)
 
+        # 3. Обработка батчами
         for batch_ids in chunks_fn(list(id_to_text.keys()), batch_size):
             items = [(i, id_to_text[i]) for i in batch_ids]
             user_content = self._build_user_payload(items, src_lang, tgt_lang)
 
             print(f"--> [Qwen {src_lang}->{tgt_lang}] batch, size={len(items)}, first_id={items[0][0]}")
-            raw = self._call_model_raw(system_prompt, user_content, max_new_tokens=max_new_tokens)
+
+            raw = self._call_model_raw(
+                system_prompt,
+                user_content,
+                max_new_tokens=max_new_tokens,
+            )
 
             try:
                 parsed = self._parse_json_response(raw)
@@ -224,6 +284,7 @@ class QwenLocalTranslator:
             pct = start + (end - start) * frac
             progress_callback(pct, f"Перевод локальной LLM (Qwen {src_lang}->{tgt_lang})...")
 
+        # 4. Собираем финальный mapping {оригинал -> перевод}
         mapping: Dict[str, str] = {}
         for txt, tid in text_to_id.items():
             t = id_to_translated.get(tid)
