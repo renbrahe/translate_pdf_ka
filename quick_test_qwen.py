@@ -1,7 +1,7 @@
 # quick_test_qwen.py
 from local_qwen_mt import QwenLocalTranslator
 
-tr = QwenLocalTranslator(model_name="Qwen/Qwen2.5-3B-Instruct")
+tr = QwenLocalTranslator(model_name="Qwen/Qwen2.5-36B-Instruct")
 
 fragments = [
     "საქართველოს მარეგულირებელი კომისია ადგენს ტარიფებს.",

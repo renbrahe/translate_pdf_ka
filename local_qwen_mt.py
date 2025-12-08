@@ -26,7 +26,7 @@ class QwenLocalTranslator:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-3B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-36B-Instruct",
         device: Optional[str] = None,
         dtype: torch.dtype = torch.float16,
     ):
