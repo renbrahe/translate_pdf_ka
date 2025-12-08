@@ -5,3 +5,5 @@ transformers>=4.46.0
 torch>=2.3.0
 sentencepiece>=0.2.0
 openpyxl
+
+hf_xet

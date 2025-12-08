@@ -10,6 +10,12 @@ from typing import Dict, List, Set, Iterable, Callable, Optional
 
 import xml.etree.ElementTree as ET
 
+from transformers import MarianMTModel, MarianTokenizer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+
+from local_nllb_translator import translate_with_nllb_ka_en
+
 # ============ Настройки по умолчанию ============
 
 DEFAULT_CHATGPT_MODEL = "gpt-4.1-mini"
@@ -28,13 +34,13 @@ DIRECTION_CONFIG: Dict[str, Dict[str, str]] = {
         "label": "Грузинский → Русский",
         "target_language": "Russian",
         "suffix": "_ru",
-        "local_model": "Helsinki-NLP/opus-mt-ka-ru",
+        "local_model": "NLLB-200-ka-ru",
     },
     "ka-en": {
         "label": "Грузинский → Английский",
         "target_language": "English",
         "suffix": "_en",
-        "local_model": "Helsinki-NLP/opus-mt-ka-en",
+        "local_model": "NLLB-200-ka-en",
     },
 }
 
@@ -810,47 +816,140 @@ def translate_with_local_model(
     end: float = 90.0,
 ) -> Dict[str, str]:
     """
-    Локальный перевод через Helsinki-NLP в зависимости от направления:
-    ka-ru -> opus-mt-ka-ru
-    ka-en -> opus-mt-ka-en
-    Требуется: pip install transformers torch sentencepiece
-    """
-    from transformers import MarianMTModel, MarianTokenizer
-    import torch
+    Универсальный локальный переводчик.
 
+    - Для ka-en и ka-ru использует одну многоязычную модель NLLB:
+        facebook/nllb-200-distilled-600M
+      ka → en  : src=kat_Geor, tgt=eng_Latn
+      ka → ru  : src=kat_Geor, tgt=rus_Cyrl
+    - Для остальных направлений (если появятся) — MarianMT по DIRECTION_CONFIG.
+
+    Всё на CPU, поэтому батчи маленькие.
+    """
+
+    if progress_callback is None:
+        def progress_callback(pct: float, msg: str) -> None:
+            pass
+
+    # Подготовка входных данных
+    remaining = [f.strip() for f in fragments if isinstance(f, str) and f.strip()]
+    total = len(remaining)
+    if total == 0:
+        return {}
+
+    # =========================
+    # 1. ka-en и ka-ru через NLLB
+    # =========================
+    if direction_code in ("ka-en", "ka-ru"):
+        MODEL_NAME = "facebook/nllb-200-distilled-600M"
+        SRC_LANG = "kat_Geor"          # грузинский
+
+        if direction_code == "ka-en":
+            TGT_LANG = "eng_Latn"      # английский
+            direction_label = "ka→en"
+        else:  # ka-ru
+            TGT_LANG = "rus_Cyrl"      # русский
+            direction_label = "ka→ru"
+
+        print(f"⏳ Загружаем локальную модель NLLB ({MODEL_NAME}) для {direction_label}...")
+        progress_callback(start, f"Загрузка локальной модели NLLB ({direction_label})...")
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SRC_LANG)
+        device = torch.device("cpu")
+        model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+        model.eval()
+
+        # В NLLB языковые коды – это обычные токены, берём id так:
+        tgt_lang_token_id = tokenizer.convert_tokens_to_ids(TGT_LANG)
+
+        mapping: Dict[str, str] = {}
+
+        BATCH_SIZE = 1          # для твоего ноутбука — минимум
+        MAX_INPUT_TOKENS = 512  # можно уменьшить до 256 при проблемах
+        MAX_OUTPUT_TOKENS = 256
+
+        done = 0
+        for i, batch in enumerate(chunks(remaining, BATCH_SIZE), start=1):
+            print(f"--> [NLLB {direction_label}] Начинаю batch {i}, размер {len(batch)}")
+
+            inputs = tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=MAX_INPUT_TOKENS,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                generated = model.generate(
+                    **inputs,
+                    forced_bos_token_id=tgt_lang_token_id,
+                    max_length=MAX_OUTPUT_TOKENS,
+                )
+
+            outputs = tokenizer.batch_decode(generated, skip_special_tokens=True)
+
+            for orig, trans in zip(batch, outputs):
+                text = (trans or "").strip()
+                mapping[orig] = text if text else orig
+
+            done += len(batch)
+            print(f"   [NLLB {direction_label}] Переведено {done}/{total} фрагментов")
+
+            frac = done / total
+            pct = start + (end - start) * frac
+            progress_callback(pct, f"Перевод локальной моделью NLLB ({direction_label})...")
+
+        return mapping
+
+    # =========================
+    # 2. Остальные направления — MarianMT (Helsinki-NLP)
+    # =========================
     meta = DIRECTION_CONFIG[direction_code]
     MODEL_NAME = meta["local_model"]
 
-    print(f"⏳ Загружаем локальную модель ({MODEL_NAME})...")
-    if progress_callback:
-        progress_callback(start, "Загрузка локальной модели...")
+    print(f"⏳ Загружаем локальную модель MarianMT ({MODEL_NAME}) для {direction_code}...")
+    progress_callback(start, "Загрузка локальной модели (MarianMT)...")
 
     tokenizer = MarianTokenizer.from_pretrained(MODEL_NAME)
-    model = MarianMTModel.from_pretrained(MODEL_NAME)
+    device = torch.device("cpu")
+    model = MarianMTModel.from_pretrained(MODEL_NAME).to(device)
+    model.eval()
 
     mapping: Dict[str, str] = {}
-    BATCH_SIZE = 64
 
-    remaining = [f for f in fragments if f.strip()]
-    total = len(remaining)
+    BATCH_SIZE = 4          # максимум для твоего ноутбука
+    MAX_TOKENS = 256
+
     done = 0
+    for i, batch in enumerate(chunks(remaining, BATCH_SIZE), start=1):
+        print(f"--> [Marian {direction_code}] Начинаю batch {i}, размер {len(batch)}")
 
-    for batch in chunks(remaining, BATCH_SIZE):
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+        inputs = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
         with torch.no_grad():
-            generated = model.generate(**inputs, max_length=512)
+            generated = model.generate(**inputs, max_length=MAX_TOKENS)
+
         outputs = tokenizer.batch_decode(generated, skip_special_tokens=True)
 
         for orig, trans in zip(batch, outputs):
-            mapping[orig] = trans if trans.strip() else orig
+            text = (trans or "").strip()
+            mapping[orig] = text if text else orig
 
         done += len(batch)
-        print(f"   Локальная модель перевела {done}/{total} фрагментов")
+        print(f"   [Marian {direction_code}] Переведено {done}/{total} фрагментов")
 
-        if progress_callback and total > 0:
-            frac = done / total
-            pct = start + (end - start) * frac
-            progress_callback(pct, "Перевод локальной моделью...")
+        frac = done / total
+        pct = start + (end - start) * frac
+        progress_callback(pct, "Перевод локальной моделью (MarianMT)...")
 
     return mapping
 
