@@ -1,17 +1,72 @@
 import os
 import re
 import json
+import time
 import zipfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-from typing import Dict, List, Set, Iterable, Callable, Optional
+from typing import Dict, List, Set, Iterable, Callable, Optional, Any
+from openai import RateLimitError
 
 import xml.etree.ElementTree as ET
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 import torch
+
+# ============ Разбиваем большой текст по токенам, чтобы не превышать ограничения ChatGPT =============
+
+def estimate_tokens(text: str) -> int:
+    """
+    Консервативная оценка количества токенов.
+
+    Раньше мы брали len(text)//3 и СИЛЬНО недооценивали.
+    Теперь считаем примерно как количество символов, с небольшим запасом.
+    Это заведомо завышает токены, но безопасно для лимита.
+    """
+    if not text:
+        return 1
+    # +20% запас сверху
+    return int(len(text) * 1.2)
+
+
+def split_fragments_by_tokens(
+    fragments: List[Dict[str, Any]],
+    max_tokens_per_batch: int = 8000,
+) -> Iterable[List[Dict[str, Any]]]:
+    """
+    Делит список фрагментов на батчи так, чтобы суммарное
+    оценочное кол-во токенов в одном батче не превышало max_tokens_per_batch.
+    """
+    batch: List[Dict[str, Any]] = []
+    current_tokens = 0
+
+    for frag in fragments:
+        text = frag["text"]
+        t = estimate_tokens(text)
+
+        # Если фрагмент сам больше лимита, отправляем его отдельно
+        if t > max_tokens_per_batch:
+            if batch:
+                yield batch
+                batch = []
+                current_tokens = 0
+            yield [frag]
+            continue
+
+        # Если добавление фрагмента переполнит партию – отдаем текущую
+        if batch and current_tokens + t > max_tokens_per_batch:
+            yield batch
+            batch = []
+            current_tokens = 0
+
+        batch.append(frag)
+        current_tokens += t
+
+    if batch:
+        yield batch
+
 
 
 # ============ Настройки по умолчанию ============
@@ -446,22 +501,25 @@ def translate_with_chatgpt(
     target_language: str,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     start: float = 10.0,
-    end: float = 90.0,
+    end: float = 60.0,
 ) -> Dict[str, str]:
     """
-    Перевод грузинских фрагментов через ChatGPT (OpenAI API).
+    Перевод грузинских фрагментов через ChatGPT (OpenAI API),
+    с разбиением по токенам и обработкой RateLimitError.
     """
     from openai import OpenAI
 
     os.environ["OPENAI_API_KEY"] = api_key
     client = OpenAI()
 
+    # Чистим и выкидываем пустое
     cleaned = []
     for f in fragments:
         s = (f or "").strip()
         if s:
             cleaned.append(s)
 
+    # Уникализируем
     unique_texts: List[str] = []
     seen: Set[str] = set()
     for s in cleaned:
@@ -472,22 +530,28 @@ def translate_with_chatgpt(
     if not unique_texts:
         return {}
 
+    # Назначаем ID
     id_to_text: Dict[int, str] = {i: txt for i, txt in enumerate(unique_texts)}
     text_to_id: Dict[str, int] = {txt: i for i, txt in id_to_text.items()}
 
     print(f"Для перевода через ChatGPT подготовлено {len(unique_texts)} уникальных фрагментов.")
 
-    BATCH_SIZE = 200
+    # Готовим фрагменты в формате {id, text} для токенного батчинга
+    fragments_struct: List[Dict[str, Any]] = [
+        {"id": i, "text": txt}
+        for i, txt in id_to_text.items()
+    ]
+
+    # Разбиваем по токенам (очень консервативно)
+    batches = list(split_fragments_by_tokens(fragments_struct, max_tokens_per_batch=8000))
+    print(f"Будет отправлено {len(batches)} батч(ей) в модель {model_name}.")
+
     total = len(unique_texts)
     done = 0
-
     id_to_translated: Dict[int, str] = {}
 
-    for batch_ids in chunks(list(id_to_text.keys()), BATCH_SIZE):
-        batch_items = [
-            {"id": i, "text": id_to_text[i]}
-            for i in batch_ids
-        ]
+    for batch_idx, batch in enumerate(batches, start=1):
+        batch_items = batch  # каждый элемент: {"id": int, "text": str}
 
         if progress_callback and total > 0:
             frac = done / total
@@ -500,6 +564,7 @@ def translate_with_chatgpt(
             "items": batch_items,
         }
 
+        # ТВОЙ system_msg — без изменений
         system_msg = (
             "You are a professional legal and technical translator. "
             "The texts are official documents (tariff methodology, regulatory acts, explanatory notes). "
@@ -515,14 +580,33 @@ def translate_with_chatgpt(
             "Do not add extra fields."
         )
 
-        resp = client.chat.completions.create(
-            model=model_name,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-        )
+        # ==== вызов модели с ретраями на RateLimit ====
+        max_retries = 5
+        delay_seconds = 10
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                    ],
+                )
+                break
+            except RateLimitError:
+                print(
+                    f"[Batch {batch_idx}/{len(batches)}] "
+                    f"Перевышен лимит токенов/минуту (попытка {attempt}/{max_retries}). "
+                    f"Ждём {delay_seconds} секунд..."
+                )
+                if attempt == max_retries:
+                    raise
+                time.sleep(delay_seconds)
+        else:
+            # Теоретически сюда не дойдём (выше raise), но оставим на всякий
+            raise RuntimeError("Не удалось получить ответ от ChatGPT после нескольких попыток.")
 
         content = resp.choices[0].message.content
         try:
@@ -549,14 +633,15 @@ def translate_with_chatgpt(
                 continue
             id_to_translated[tid_int] = ttext
 
-        done += len(batch_ids)
-        print(f"   ChatGPT перевёл {done}/{total} уникальных фрагментов")
+        done += len(batch_items)
+        print(f"   ChatGPT перевёл {done}/{total} уникальных фрагментов (batch {batch_idx}/{len(batches)})")
 
         if progress_callback and total > 0:
             frac = done / total
             pct = start + (end - start) * frac
             progress_callback(pct, "Перевод через ChatGPT...")
 
+    # Собираем mapping: исходный текст -> перевод
     mapping: Dict[str, str] = {}
     for txt, tid in text_to_id.items():
         trans = id_to_translated.get(tid)
@@ -566,7 +651,6 @@ def translate_with_chatgpt(
             mapping[txt] = txt
 
     return mapping
-
 
 def post_edit_with_chatgpt(
     mapping: Dict[str, str],
@@ -578,7 +662,8 @@ def post_edit_with_chatgpt(
     end: float = 90.0,
 ) -> Dict[str, str]:
     """
-    Литературная вычитка уже переведённого текста через ChatGPT.
+    Литературная вычитка уже переведённого текста через ChatGPT,
+    с аккуратным батчингом и обработкой RateLimitError.
     """
     from openai import OpenAI
 
@@ -588,14 +673,15 @@ def post_edit_with_chatgpt(
     unique_values: List[str] = []
     seen = set()
     for v in mapping.values():
-        if v not in seen and v.strip():
+        if v not in seen and isinstance(v, str) and v.strip():
             seen.add(v)
             unique_values.append(v)
 
     if not unique_values:
         return mapping
 
-    BATCH_SIZE = 200
+    # Можно сделать батч поменьше, чтобы не вылазить по токенам
+    BATCH_SIZE = 100
     total = len(unique_values)
     done = 0
 
@@ -622,14 +708,31 @@ def post_edit_with_chatgpt(
             "Keys MUST be EXACTLY the original texts. Do not add extra fields."
         )
 
-        resp = client.chat.completions.create(
-            model=model_name,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-        )
+        # ==== вызов модели с ретраями на RateLimit ====
+        max_retries = 5
+        delay_seconds = 10
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                    ],
+                )
+                break
+            except RateLimitError as e:
+                print(
+                    f"[Post-edit batch] Перевышен лимит токенов/минуту "
+                    f"(попытка {attempt}/{max_retries}). Ждём {delay_seconds} секунд..."
+                )
+                if attempt == max_retries:
+                    raise
+                time.sleep(delay_seconds)
+        else:
+            raise RuntimeError("Не удалось получить ответ от ChatGPT (post_edit) после нескольких попыток.")
 
         content = resp.choices[0].message.content
         try:
@@ -654,6 +757,7 @@ def post_edit_with_chatgpt(
             pct = start + (end - start) * frac
             progress_callback(pct, "Литературная вычитка перевода (ChatGPT)...")
 
+    # Собираем новый mapping: грузинский -> улучшенный перевод
     new_mapping: Dict[str, str] = {}
     for geo, raw_trans in mapping.items():
         new_mapping[geo] = improved_map.get(raw_trans, raw_trans)
@@ -670,7 +774,8 @@ def fix_spacing_with_chatgpt(
     end: float = 90.0,
 ) -> Dict[str, str]:
     """
-    Аккуратная правка ПРОБЕЛОВ в уже переведённом русском тексте.
+    Аккуратная правка ПРОБЕЛОВ в уже переведённом русском тексте,
+    с обработкой RateLimitError.
     """
     from openai import OpenAI
 
@@ -712,14 +817,31 @@ def fix_spacing_with_chatgpt(
             "Keys MUST be EXACTLY the original strings. Do not add extra fields."
         )
 
-        resp = client.chat.completions.create(
-            model=model_name,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-        )
+        # ==== вызов модели с ретраями на RateLimit ====
+        max_retries = 5
+        delay_seconds = 10
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                    ],
+                )
+                break
+            except RateLimitError as e:
+                print(
+                    f"[Fix-spacing batch] Перевышен лимит токенов/минуту "
+                    f"(попытка {attempt}/{max_retries}). Ждём {delay_seconds} секунд..."
+                )
+                if attempt == max_retries:
+                    raise
+                time.sleep(delay_seconds)
+        else:
+            raise RuntimeError("Не удалось получить ответ от ChatGPT (fix_spacing) после нескольких попыток.")
 
         content = resp.choices[0].message.content
         try:
