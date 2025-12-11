@@ -67,6 +67,43 @@ def split_fragments_by_tokens(
     if batch:
         yield batch
 
+def split_texts_by_tokens(
+    texts: List[str],
+    max_tokens_per_batch: int = 8000,
+) -> Iterable[List[str]]:
+    """
+    Делит список строк на батчи так, чтобы суммарное
+    оценочное число токенов в батче не превышало max_tokens_per_batch.
+    Использует estimate_tokens(), как и для перевода.
+    """
+    batch: List[str] = []
+    current_tokens = 0
+
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        t = estimate_tokens(text)
+
+        # если один текст сам по себе больше лимита — отправляем его в отдельном батче
+        if t > max_tokens_per_batch:
+            if batch:
+                yield batch
+                batch = []
+                current_tokens = 0
+            yield [text]
+            continue
+
+        # если добавление этого текста переполнит батч — отдаем текущий и начинаем новый
+        if batch and current_tokens + t > max_tokens_per_batch:
+            yield batch
+            batch = []
+            current_tokens = 0
+
+        batch.append(text)
+        current_tokens += t
+
+    if batch:
+        yield batch
 
 
 # ============ Настройки по умолчанию ============
@@ -663,7 +700,7 @@ def post_edit_with_chatgpt(
 ) -> Dict[str, str]:
     """
     Литературная вычитка уже переведённого текста через ChatGPT,
-    с аккуратным батчингом и обработкой RateLimitError.
+    с аккуратным батчингом по токенам и обработкой RateLimitError.
     """
     from openai import OpenAI
 
@@ -673,21 +710,36 @@ def post_edit_with_chatgpt(
     unique_values: List[str] = []
     seen = set()
     for v in mapping.values():
-        if v not in seen and isinstance(v, str) and v.strip():
+        if isinstance(v, str) and v.strip() and v not in seen:
             seen.add(v)
             unique_values.append(v)
 
     if not unique_values:
         return mapping
 
-    # Можно сделать батч поменьше, чтобы не вылазить по токенам
-    BATCH_SIZE = 100
     total = len(unique_values)
     done = 0
 
+    # делим не по количеству штук, а по оценочным токенам
+    batches = list(split_texts_by_tokens(unique_values, max_tokens_per_batch=8000))
+    print(f"[Post-edit] Будет отправлено {len(batches)} батч(ей) в модель {model_name}.")
+
     improved_map: Dict[str, str] = {}
 
-    for batch in chunks(unique_values, BATCH_SIZE):
+    system_msg = (
+        "You are a professional editor for legal, regulatory and technical documents. "
+        f"Improve style, clarity, grammar and fluency in {target_language} while preserving the same meaning, facts, numbers and legal content. "
+        "You MAY change word order, fix awkward literal phrases, adjust cases and morphology, "
+        "replace unnatural calques with standard legal expressions, and break or merge sentences if it improves readability. "
+        "Do NOT add new facts or remove existing ones. "
+        "Return ONLY a JSON object mapping each original text to its improved version. "
+        "Keys MUST be EXACTLY the original texts. Do not add extra fields."
+    )
+
+    max_retries = 5
+    delay_seconds = 10
+
+    for batch_idx, batch in enumerate(batches, start=1):
         if progress_callback and total > 0:
             frac = done / total
             pct = start + (end - start) * frac
@@ -697,20 +749,6 @@ def post_edit_with_chatgpt(
             "target_language": target_language,
             "texts": batch,
         }
-
-        system_msg = (
-            "You are a professional editor for legal, regulatory and technical documents. "
-            f"Improve style, clarity, grammar and fluency in {target_language} while preserving the same meaning, facts, numbers and legal content. "
-            "You MAY change word order, fix awkward literal phrases, adjust cases and morphology, "
-            "replace unnatural calques with standard legal expressions, and break or merge sentences if it improves readability. "
-            "Do NOT add new facts or remove existing ones. "
-            "Return ONLY a JSON object mapping each original text to its improved version. "
-            "Keys MUST be EXACTLY the original texts. Do not add extra fields."
-        )
-
-        # ==== вызов модели с ретраями на RateLimit ====
-        max_retries = 5
-        delay_seconds = 10
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -724,10 +762,14 @@ def post_edit_with_chatgpt(
                 )
                 break
             except RateLimitError as e:
+                msg = str(e)
                 print(
-                    f"[Post-edit batch] Перевышен лимит токенов/минуту "
-                    f"(попытка {attempt}/{max_retries}). Ждём {delay_seconds} секунд..."
+                    f"[Post-edit batch {batch_idx}/{len(batches)}] "
+                    f"Перевышен лимит (попытка {attempt}/{max_retries}): {msg}"
                 )
+                # если ошибка говорит, что запрос слишком большой, ретраи не помогут
+                if "Request too large" in msg and "tokens per min" in msg:
+                    raise
                 if attempt == max_retries:
                     raise
                 time.sleep(delay_seconds)
@@ -750,7 +792,7 @@ def post_edit_with_chatgpt(
                 improved_map[orig_text] = orig_text
 
         done += len(batch)
-        print(f"   ChatGPT вычитал {done}/{total} фрагментов")
+        print(f"   ChatGPT вычитал {done}/{total} фрагментов (batch {batch_idx}/{len(batches)})")
 
         if progress_callback and total > 0:
             frac = done / total
@@ -760,9 +802,13 @@ def post_edit_with_chatgpt(
     # Собираем новый mapping: грузинский -> улучшенный перевод
     new_mapping: Dict[str, str] = {}
     for geo, raw_trans in mapping.items():
-        new_mapping[geo] = improved_map.get(raw_trans, raw_trans)
+        if isinstance(raw_trans, str):
+            new_mapping[geo] = improved_map.get(raw_trans, raw_trans)
+        else:
+            new_mapping[geo] = raw_trans
 
     return new_mapping
+
 
 
 def fix_spacing_with_chatgpt(
@@ -775,7 +821,7 @@ def fix_spacing_with_chatgpt(
 ) -> Dict[str, str]:
     """
     Аккуратная правка ПРОБЕЛОВ в уже переведённом русском тексте,
-    с обработкой RateLimitError.
+    с батчингом по токенам и обработкой RateLimitError.
     """
     from openai import OpenAI
 
@@ -785,20 +831,34 @@ def fix_spacing_with_chatgpt(
     unique_values: List[str] = []
     seen = set()
     for v in mapping.values():
-        if isinstance(v, str) and v not in seen and v.strip():
+        if isinstance(v, str) and v.strip() and v not in seen:
             seen.add(v)
             unique_values.append(v)
 
     if not unique_values:
         return mapping
 
-    BATCH_SIZE = 200
     total = len(unique_values)
     done = 0
 
+    batches = list(split_texts_by_tokens(unique_values, max_tokens_per_batch=8000))
+    print(f"[Fix-spacing] Будет отправлено {len(batches)} батч(ей) в модель {model_name}.")
+
     fixed_map: Dict[str, str] = {}
 
-    for batch in chunks(unique_values, BATCH_SIZE):
+    system_msg = (
+        "You receive Russian texts which are already translated correctly. "
+        "Your ONLY task is to fix spacing errors: insert or delete ASCII space characters (U+0020) "
+        "where necessary between words, numbers and punctuation, and collapse multiple spaces to single ones if appropriate. "
+        "You MUST NOT change, delete, reorder or insert ANY non-space characters (letters, digits, punctuation). "
+        "Return ONLY a JSON object mapping each original string to its corrected version. "
+        "Keys MUST be EXACTLY the original strings. Do not add extra fields."
+    )
+
+    max_retries = 5
+    delay_seconds = 10
+
+    for batch_idx, batch in enumerate(batches, start=1):
         if progress_callback and total > 0:
             frac = done / total
             pct = start + (end - start) * frac
@@ -807,19 +867,6 @@ def fix_spacing_with_chatgpt(
         user_payload = {
             "texts": batch,
         }
-
-        system_msg = (
-            "You receive Russian texts which are already translated correctly. "
-            "Your ONLY task is to fix spacing errors: insert or delete ASCII space characters (U+0020) "
-            "where necessary between words, numbers and punctuation, and collapse multiple spaces to single ones if appropriate. "
-            "You MUST NOT change, delete, reorder or insert ANY non-space characters (letters, digits, punctuation). "
-            "Return ONLY a JSON object mapping each original string to its corrected version. "
-            "Keys MUST be EXACTLY the original strings. Do not add extra fields."
-        )
-
-        # ==== вызов модели с ретраями на RateLimit ====
-        max_retries = 5
-        delay_seconds = 10
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -833,10 +880,13 @@ def fix_spacing_with_chatgpt(
                 )
                 break
             except RateLimitError as e:
+                msg = str(e)
                 print(
-                    f"[Fix-spacing batch] Перевышен лимит токенов/минуту "
-                    f"(попытка {attempt}/{max_retries}). Ждём {delay_seconds} секунд..."
+                    f"[Fix-spacing batch {batch_idx}/{len(batches)}] "
+                    f"Перевышен лимит (попытка {attempt}/{max_retries}): {msg}"
                 )
+                if "Request too large" in msg and "tokens per min" in msg:
+                    raise
                 if attempt == max_retries:
                     raise
                 time.sleep(delay_seconds)
@@ -859,7 +909,7 @@ def fix_spacing_with_chatgpt(
                 fixed_map[orig_text] = orig_text
 
         done += len(batch)
-        print(f"   ChatGPT поправил пробелы в {done}/{total} фрагментах")
+        print(f"   ChatGPT поправил пробелы в {done}/{total} фрагментах (batch {batch_idx}/{len(batches)})")
 
         if progress_callback and total > 0:
             frac = done / total
@@ -874,6 +924,7 @@ def fix_spacing_with_chatgpt(
             new_mapping[geo] = ru
 
     return new_mapping
+
 
 
 # ============ Переводчик NLLB (локальный) ============
