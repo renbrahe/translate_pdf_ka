@@ -15,6 +15,15 @@ import xml.etree.ElementTree as ET
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 import torch
 
+# ===== хелпер “включить оффлайн” ======
+
+def enable_hf_offline() -> None:
+    # Полностью запрещаем HuggingFace/transformers ходить в интернет
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+
 # ============ Разбиваем большой текст по токенам, чтобы не превышать ограничения ChatGPT =============
 
 def estimate_tokens(text: str) -> int:
@@ -145,6 +154,10 @@ def is_docx(path: str) -> bool:
 
 def is_xlsx(path: str) -> bool:
     return path.lower().endswith(".xlsx")
+
+
+def is_pptx(path: str) -> bool:
+    return path.lower().endswith(".pptx")
 
 
 def chunks(lst: List[str], n: int) -> Iterable[List[str]]:
@@ -304,31 +317,73 @@ def collect_fragments_xlsx(path: str) -> Set[str]:
     return to_translate
 
 
+def collect_fragments_pptx(path: str) -> Set[str]:
+    """
+    PPTX — это ZIP. Текст обычно лежит в:
+      - ppt/slides/*.xml
+      - ppt/notesSlides/*.xml
+      - ppt/slideLayouts/*.xml
+      - ppt/slideMasters/*.xml
+      - ppt/presentation.xml
+    Мы просто извлекаем все текстовые узлы с грузинским из этих XML.
+    """
+    to_translate: Set[str] = set()
+
+    with zipfile.ZipFile(path, "r") as zin:
+        for info in zin.infolist():
+            fname = info.filename
+            low = fname.lower()
+
+            if not low.endswith(".xml"):
+                continue
+
+            # Берём только "ppt/..." (чтобы не ковырять лишнее)
+            if not low.startswith("ppt/"):
+                continue
+
+            # Ограничиваемся теми частями, где реально бывает текст
+            if not (
+                low.startswith("ppt/slides/")
+                or low.startswith("ppt/notesslides/")
+                or low.startswith("ppt/slidelayouts/")
+                or low.startswith("ppt/slidemasters/")
+                or low == "ppt/presentation.xml"
+            ):
+                continue
+
+            xml_bytes = zin.read(fname)
+            frags = collect_georgian_fragments_from_xml_bytes(xml_bytes)
+            to_translate.update(frags)
+
+    print(f"📽️ PPTX: найдено {len(to_translate)} уникальных грузинских фрагментов.")
+    return to_translate
+
+
+
 def replace_georgian_in_xml_bytes(xml_bytes: bytes, mapping: Dict[str, str]) -> bytes:
-    """
-    Для XLSX: если текст узла (strip) есть в mapping — заменяем целиком,
-    сохраняя ведущие/хвостовые пробелы.
-    """
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return xml_bytes
 
-    for elem in root.iter():
-        text = elem.text
-        if not text:
-            continue
-
-        stripped = text.strip()
+    def _replace(s: Optional[str]) -> Optional[str]:
+        if not s:
+            return s
+        stripped = s.strip()
         if stripped in mapping:
-            prefix_len = len(text) - len(text.lstrip())
-            suffix_len = len(text) - len(text.rstrip())
-            prefix = text[:prefix_len]
-            suffix = text[len(text) - suffix_len:] if suffix_len > 0 else ""
-            new_text = mapping[stripped]
-            elem.text = f"{prefix}{new_text}{suffix}"
+            prefix_len = len(s) - len(s.lstrip())
+            suffix_len = len(s) - len(s.rstrip())
+            prefix = s[:prefix_len]
+            suffix = s[len(s) - suffix_len:] if suffix_len > 0 else ""
+            return f"{prefix}{mapping[stripped]}{suffix}"
+        return s
+
+    for elem in root.iter():
+        elem.text = _replace(elem.text)
+        elem.tail = _replace(elem.tail)
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
 
 
 def process_docx_xml_paragraphs(
@@ -527,6 +582,47 @@ def apply_translations_xlsx(
 
     wb.save(output_path)
     print(f"💾 XLSX сохранён: {output_path}, изменённых ячеек: {changed_cells}")
+
+
+def apply_translations_pptx(
+    input_path: str,
+    output_path: str,
+    text_mapping: Dict[str, str],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    start: float = 90.0,
+    end: float = 100.0,
+) -> None:
+    """
+    Применяем переводы к PPTX: проходим по ppt/*.xml и делаем замену в текстовых узлах.
+    """
+    with zipfile.ZipFile(input_path, "r") as zin, \
+         zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+
+        infos = zin.infolist()
+        total = len(infos) if infos else 1
+        changed = 0
+
+        for idx, info in enumerate(infos, start=1):
+            fname = info.filename
+            data = zin.read(fname)
+            new_data = data
+
+            low = fname.lower()
+            if low.startswith("ppt/") and low.endswith(".xml"):
+                new_data = replace_georgian_in_xml_bytes(new_data, text_mapping)
+
+            if new_data != data:
+                changed += 1
+
+            zout.writestr(info, new_data)
+
+            if progress_callback:
+                frac = idx / total
+                pct = start + (end - start) * frac
+                progress_callback(pct, "Применение перевода в PPTX...")
+
+    print(f"💾 PPTX сохранён: {output_path}, изменённых XML: {changed}")
+
 
 
 # ============ Переводчики (ChatGPT) ============
@@ -970,9 +1066,19 @@ def translate_with_local_model(
     if progress_callback:
         progress_callback(start, f"Загрузка локальной модели NLLB ({MODEL_NAME})…")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, src_lang=SRC_LANG)
+    enable_hf_offline()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        src_lang=SRC_LANG,
+        local_files_only=True,
+    )
     device = torch.device("cpu")
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME).to(device)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        MODEL_NAME,
+        local_files_only=True,
+    ).to(device)
+
     model.eval()
 
     BATCH_SIZE = 1
@@ -1053,16 +1159,30 @@ def post_edit_with_qwen_local(
     if progress_callback:
         progress_callback(start, f"Загрузка Qwen2.5-3B-Instruct для вычитки…")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    enable_hf_offline()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.float16,
             device_map="auto",
+            trust_remote_code=True,
+            local_files_only=True,
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            trust_remote_code=True,
+            local_files_only=True,
+        ).to(device)
+
     model.eval()
 
     system_msg_text = (
@@ -1201,8 +1321,8 @@ def process_file(
         def progress_callback(pct: float, msg: str) -> None:
             pass  # заглушка
 
-    if not (is_docx(file_path) or is_xlsx(file_path)):
-        raise ValueError("Поддерживаются только файлы .docx и .xlsx")
+    if not (is_docx(file_path) or is_xlsx(file_path) or is_pptx(file_path)):
+        raise ValueError("Поддерживаются только файлы .docx, .xlsx и .pptx")
 
     if direction_code not in DIRECTION_CONFIG:
         raise ValueError(f"Неизвестное направление: {direction_code}")
@@ -1213,6 +1333,8 @@ def process_file(
 
     # 1. Сбор фрагментов
     progress_callback(0.0, "Сбор грузинских фрагментов...")
+
+    items_for_docx = None
 
     if is_docx(file_path):
         items = collect_docx_items(file_path)
@@ -1228,7 +1350,6 @@ def process_file(
                 fname = info.filename
                 if not fname.lower().endswith(".xml"):
                     continue
-
                 xml_bytes = zin.read(fname)
                 extra_texts.update(collect_georgian_fragments_from_xml_bytes(xml_bytes))
 
@@ -1240,13 +1361,20 @@ def process_file(
         )
 
         items_for_docx = items
+
+    elif is_pptx(file_path):
+        fragments_set = collect_fragments_pptx(file_path)
+        if not fragments_set:
+            progress_callback(0.0, "Грузинский текст не найден.")
+            raise RuntimeError("В файле не найден грузинский текст для перевода.")
+        fragments_for_translation = sorted(fragments_set)
+
     else:
         fragments_set = collect_fragments_xlsx(file_path)
         if not fragments_set:
             progress_callback(0.0, "Грузинский текст не найден.")
             raise RuntimeError("В файле не найден грузинский текст для перевода.")
         fragments_for_translation = sorted(fragments_set)
-        items_for_docx = None
 
     print(f"Найдено {len(fragments_for_translation)} уникальных фрагментов для перевода.")
     progress_callback(5.0, f"Найдено {len(fragments_for_translation)} фрагментов. Подготовка к переводу...")
@@ -1314,11 +1442,21 @@ def process_file(
     output_path = f"{base}{suffix}{ext}"
 
     progress_callback(90.0, "Применяем переводы к файлу...")
+
     if is_docx(file_path):
         apply_translations_docx(
             file_path,
             output_path,
             id_mapping,
+            mapping_text_to_trans,
+            progress_callback=progress_callback,
+            start=90.0,
+            end=100.0,
+        )
+    elif is_pptx(file_path):
+        apply_translations_pptx(
+            file_path,
+            output_path,
             mapping_text_to_trans,
             progress_callback=progress_callback,
             start=90.0,
@@ -1335,10 +1473,12 @@ def process_file(
         )
 
     progress_callback(100.0, "Готово.")
+
     if is_docx(output_path):
         debug_scan_docx_for_georgian(output_path)
 
     return output_path
+
 
 
 # ============ GUI (Tkinter) ============
@@ -1346,7 +1486,7 @@ def process_file(
 class TranslatorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Перевод грузинского текста в DOCX/XLSX")
+        self.root.title("Перевод грузинского текста в DOCX/XLSX/PPTX")
 
         self.file_path_var = tk.StringVar()
         self.env_path_var = tk.StringVar()
@@ -1370,7 +1510,7 @@ class TranslatorGUI:
         frm = ttk.Frame(self.root, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(frm, text="Файл DOCX/XLSX:").grid(row=0, column=0, sticky="w", pady=pad)
+        ttk.Label(frm, text="Файл DOCX/XLSX/PPTX:").grid(row=0, column=0, sticky="w", pady=pad)
         entry_file = ttk.Entry(frm, textvariable=self.file_path_var, width=60)
         entry_file.grid(row=0, column=1, sticky="we", pady=pad)
         ttk.Button(frm, text="Выбрать...", command=self.choose_file).grid(row=0, column=2, padx=pad, pady=pad)
@@ -1459,8 +1599,8 @@ class TranslatorGUI:
 
     def choose_file(self):
         path = filedialog.askopenfilename(
-            title="Выберите DOCX или XLSX",
-            filetypes=[("Office files", "*.docx *.xlsx"), ("Все файлы", "*.*")],
+            title="Выберите DOCX/XLSX/PPTX",
+            filetypes=[("Office files", "*.docx *.xlsx *.pptx"), ("Все файлы", "*.*")],
         )
         if path:
             self.file_path_var.set(path)
@@ -1497,11 +1637,11 @@ class TranslatorGUI:
     def run_translation(self):
         file_path = self.file_path_var.get().strip()
         if not file_path:
-            messagebox.showerror("Ошибка", "Выберите файл DOCX/XLSX.")
+            messagebox.showerror("Ошибка", "Выберите файл DOCX/XLSX/PPTX.")
             return
 
-        if not (is_docx(file_path) or is_xlsx(file_path)):
-            messagebox.showerror("Ошибка", "Поддерживаются только файлы .docx и .xlsx.")
+        if not (is_docx(file_path) or is_xlsx(file_path) or is_pptx(file_path)):
+            messagebox.showerror("Ошибка", "Поддерживаются только файлы .docx, .xlsx и .pptx.")
             return
 
         translator_kind = self.translator_var.get()
