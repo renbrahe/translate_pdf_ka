@@ -921,12 +921,16 @@ def fix_spacing_with_chatgpt(
 # ============ Переводчик NLLB (локальный) — ЕДИНСТВЕННЫЙ БЛОК (без дублей) ============
 # Цель: приоритет "НИ ОДНОГО НЕПЕРЕВЕДЕННОГО КУСКА" (особенно грузинского),
 # при этом сохраняем цифры/даты/суммы через плейсхолдеры, но без жёсткого отката в оригинал.
+# + Нормализация VAT: "დღგ", "დღგ-ს" и ошибочное "ДН" -> "НДС"
 
 # Плейсхолдеры делаем "устойчивыми" к пробелам: __ PH 12 __ -> __PH12__
 _PH_RE_CANON = re.compile(r"__PH\d+__")
 _PH_RE_FUZZY = re.compile(r"__\s*PH\s*(\d+)\s*__")
 
 _RE_KA = re.compile(r"[\u10A0-\u10FF]")  # Georgian unicode block
+
+_RE_VAT_BAD_DN = re.compile(r"\bДН\b", re.IGNORECASE)
+_RE_VAT_KA = re.compile(r"(?:\b|\s)(დღგ)(?:-ს|-ის)?(?:\b)", flags=re.IGNORECASE)
 
 
 def _has_ka(s: str) -> bool:
@@ -952,10 +956,34 @@ def _normalize_spaces(s: str) -> str:
     return s.strip()
 
 
+def _fix_vat_terms(s: str) -> str:
+    """
+    Приводим VAT термины к "НДС":
+    - "ДН" -> "НДС"
+    - "დღგ", "დღგ-ს", "დღგ-ის" -> "НДС"
+    """
+    if not isinstance(s, str) or not s:
+        return s or ""
+
+    s = _RE_VAT_BAD_DN.sub("НДС", s)
+
+    # заменяем грузинские формы НДС на "НДС" (с сохранением пробела/границы)
+    def _vat_sub(m: re.Match) -> str:
+        # m.group(0) содержит ведущий пробел или границу, m.group(1) == "დღგ"
+        return m.group(0).replace(m.group(1), "НДС")
+
+    s = _RE_VAT_KA.sub(_vat_sub, s)
+
+    # подчистка редких артефактов, если вдруг получилось "НДС-с" / "НДС-ис"
+    s = re.sub(r"\bНДС\s*-\s*(с|ис)\b", "НДС", s, flags=re.IGNORECASE)
+    return s
+
+
 def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
     """
     Замораживаем уязвимые сущности, чтобы NLLB не портил номера/даты/суммы.
     "Голые" числа — мягко: только 4+ цифры.
+    Дополнительно: замораживаем "დღგ(-ს/-ის)" чтобы не превращалось в "ДН".
     """
     if not isinstance(text, str) or not text:
         return text, {}
@@ -964,6 +992,7 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
     idx = 0
 
     patterns = [
+        r"(?:\bდღგ(?:-ს|-ის)?\b)",  # VAT по-грузински -> потом нормализуем в "НДС"
         r"(?:(?:№|#|N)\s?\d+(?:[/-]\d+){0,3})",
         r"(?:\b(?:Art\.|Article|ст\.|Статья|п\.|пп\.|Пункт|параграф)\s*\d+(?:\.\d+){0,3}\b)",
         r"(?:\b\d+(?:\.\d+){1,4}\b)",
@@ -1058,6 +1087,7 @@ def translate_with_local_model(
       вместо этого: нормализация -> ретрай -> fallback на перевод без заморозки
     - финальная гарантия: если после всего остался грузинский, делаем догоняющий перевод
     - нет truncation=True (не режем смысл молча)
+    - VAT: "დღგ/დღგ-ს/დღг-ის" и "ДН" -> "НДС"
     """
 
     LANG_MAP = {"ka": "kat_Geor", "ru": "rus_Cyrl", "en": "eng_Latn"}
@@ -1145,7 +1175,7 @@ def translate_with_local_model(
 
         batch_subchunks: List[List[str]] = []
         batch_freeze_meta: List[List[Dict[str, str]]] = []
-        batch_raw_pieces: List[List[str]] = []   # те же куски, но без заморозки (на случай fallback)
+        batch_raw_pieces: List[List[str]] = []  # те же куски, но без заморозки (на случай fallback)
         batch_orig_texts: List[str] = []
 
         for orig in batch:
@@ -1206,28 +1236,34 @@ def translate_with_local_model(
                 # 2) разморозка того, что осталось (если плейсхолдеры сохранились)
                 t = _unfreeze_legal_entities(t, meta)
                 t = _normalize_spaces(t)
+                t = _fix_vat_terms(t)
 
                 # 3) финальная гарантия: если ka→(не ka) и остался грузинский — догоняем
                 if src == "ka" and tgt != "ka" and _has_ka(t):
                     repaired = _translate_texts([t])[0]
                     if repaired and not _has_ka(repaired):
                         t = _normalize_spaces(repaired)
+                        t = _fix_vat_terms(t)
 
-                # 4) в крайнем случае (совсем провал) — всё равно НЕ возвращаем грузинский кусок
-                # если это ka→ru и t всё ещё грузинский, пытаемся перевести raw ещё раз
+                # 4) если всё ещё грузинский — пытаемся перевести raw ещё раз
                 if src == "ka" and tgt != "ka" and _has_ka(t) and raw_p:
                     repaired2 = _translate_texts([raw_p])[0]
                     if repaired2:
                         t = _normalize_spaces(repaired2)
+                        t = _fix_vat_terms(t)
 
-                unfrozen_pieces.append(t if t else _normalize_spaces(_unfreeze_legal_entities(fp_norm, meta)))
+                unfrozen_pieces.append(
+                    t if t else _fix_vat_terms(_normalize_spaces(_unfreeze_legal_entities(fp_norm, meta)))
+                )
 
             merged = _rejoin_translated(unfrozen_pieces)
+            merged = _fix_vat_terms(_normalize_spaces(merged))
+
             if src == "ka" and tgt != "ka" and _has_ka(merged):
                 # финальный общий догоняющий проход по склеенному абзацу
                 repaired = _translate_texts([merged])[0]
                 if repaired and not _has_ka(repaired):
-                    merged = _normalize_spaces(repaired)
+                    merged = _fix_vat_terms(_normalize_spaces(repaired))
 
             mapping[orig] = merged if merged else orig
 
