@@ -9,28 +9,44 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 from typing import Dict, List, Set, Iterable, Callable, Optional, Any, Tuple
 
-from openai import RateLimitError
 import xml.etree.ElementTree as ET
 
+from openai import RateLimitError
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 import torch
 
 
-# ===== хелпер “включить оффлайн” ======
+# =============================================================================
+# HuggingFace ONLINE/OFFLINE helpers (правильно и без дублей)
+# =============================================================================
 
-def enable_hf_offline() -> None:
-    # Полностью запрещаем HuggingFace/transformers ходить в интернет
+def hf_enable_online() -> None:
+    """Разрешить HuggingFace/transformers ходить в интернет (снять offline-флаги)."""
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+
+
+def hf_enable_offline() -> None:
+    """Запретить HuggingFace/transformers ходить в интернет."""
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 
-# ============ Разбиваем большой текст по токенам, чтобы не превышать ограничения ChatGPT =============
+def hf_print_mode(prefix: str = "") -> None:
+    """Для отладки."""
+    print(
+        f"{prefix}HF_HUB_OFFLINE={os.getenv('HF_HUB_OFFLINE')} "
+        f"TRANSFORMERS_OFFLINE={os.getenv('TRANSFORMERS_OFFLINE')}"
+    )
+
+
+# =============================================================================
+# Token split (для ChatGPT батчей)
+# =============================================================================
 
 def estimate_tokens(text: str) -> int:
-    """
-    Консервативная оценка количества токенов.
-    """
+    """Консервативная оценка количества токенов."""
     if not text:
         return 1
     return int(len(text) * 1.2)  # +20% запас сверху
@@ -99,7 +115,9 @@ def split_texts_by_tokens(
         yield batch
 
 
-# ============ Настройки по умолчанию ============
+# =============================================================================
+# Настройки
+# =============================================================================
 
 DEFAULT_CHATGPT_MODEL = "gpt-4.1-mini"
 CHATGPT_MODELS = [
@@ -111,25 +129,18 @@ CHATGPT_MODELS = [
     "gpt-5-mini",
 ]
 
-# направления перевода: грузинский -> целевой язык
 DIRECTION_CONFIG: Dict[str, Dict[str, str]] = {
-    "ka-ru": {
-        "label": "Грузинский → Русский",
-        "target_language": "Russian",
-        "suffix": "_ru",
-    },
-    "ka-en": {
-        "label": "Грузинский → Английский",
-        "target_language": "English",
-        "suffix": "_en",
-    },
+    "ka-ru": {"label": "Грузинский → Русский", "target_language": "Russian", "suffix": "_ru"},
+    "ka-en": {"label": "Грузинский → Английский", "target_language": "English", "suffix": "_en"},
 }
 
 # диапазоны Unicode для грузинского
 GEORGIAN_RE = re.compile(r"[\u10A0-\u10FF\u1C90-\u1CBF]+")
 
 
-# ============ Утилиты ============
+# =============================================================================
+# Утилиты
+# =============================================================================
 
 def is_docx(path: str) -> bool:
     return path.lower().endswith(".docx")
@@ -186,7 +197,9 @@ def get_direction_code_from_label(label: str) -> str:
     raise ValueError(f"Неизвестное направление перевода: {label}")
 
 
-# ============ Работа с XML внутри DOCX/XLSX/PPTX ============
+# =============================================================================
+# Работа с XML внутри DOCX/XLSX/PPTX
+# =============================================================================
 
 def collect_docx_items(path: str) -> List[Dict[str, object]]:
     """
@@ -242,9 +255,7 @@ def collect_docx_items(path: str) -> List[Dict[str, object]]:
 
 
 def collect_georgian_fragments_from_xml_bytes(xml_bytes: bytes) -> Set[str]:
-    """
-    Находим все текстовые узлы, содержащие грузинский, и берём их strip().
-    """
+    """Находим все текстовые узлы, содержащие грузинский, и берём их strip()."""
     result: Set[str] = set()
     try:
         root = ET.fromstring(xml_bytes)
@@ -263,9 +274,7 @@ def collect_georgian_fragments_from_xml_bytes(xml_bytes: bytes) -> Set[str]:
 
 
 def collect_fragments_xlsx(path: str) -> Set[str]:
-    """
-    XLSX — обрабатываем sharedStrings + worksheets.
-    """
+    """XLSX — обрабатываем sharedStrings + worksheets."""
     to_translate: Set[str] = set()
 
     with zipfile.ZipFile(path, "r") as zin:
@@ -287,9 +296,7 @@ def collect_fragments_xlsx(path: str) -> Set[str]:
 
 
 def collect_fragments_pptx(path: str) -> Set[str]:
-    """
-    PPTX — извлекаем грузинский текст из ppt/*.xml (слайды, заметки, мастера и т.п.)
-    """
+    """PPTX — извлекаем грузинский текст из ppt/*.xml."""
     to_translate: Set[str] = set()
 
     with zipfile.ZipFile(path, "r") as zin:
@@ -320,9 +327,7 @@ def collect_fragments_pptx(path: str) -> Set[str]:
 
 
 def replace_georgian_in_xml_bytes(xml_bytes: bytes, mapping: Dict[str, str]) -> bytes:
-    """
-    Общая замена: подменяем elem.text/elem.tail если stripped ровно в mapping.
-    """
+    """Общая замена: подменяем elem.text/elem.tail если stripped ровно в mapping."""
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
@@ -347,11 +352,7 @@ def replace_georgian_in_xml_bytes(xml_bytes: bytes, mapping: Dict[str, str]) -> 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def process_docx_xml_paragraphs(
-    xml_bytes: bytes,
-    xml_name: str,
-    id_mapping: Dict[str, str],
-) -> bytes:
+def process_docx_xml_paragraphs(xml_bytes: bytes, xml_name: str, id_mapping: Dict[str, str]) -> bytes:
     """
     Для DOCX: заменяем текст абзаца <w:p> по id_mapping.
     Защита: если в абзаце уже нет грузинских букв — не трогаем.
@@ -375,11 +376,9 @@ def process_docx_xml_paragraphs(
         if not t_elems:
             continue
 
-        orig_parts = [(t.text or "") for t in t_elems]
-        orig_full = "".join(orig_parts)
+        orig_full = "".join([(t.text or "") for t in t_elems])
         if not orig_full:
             continue
-
         if not GEORGIAN_RE.search(orig_full):
             continue
 
@@ -399,9 +398,7 @@ def process_docx_xml_paragraphs(
 
 
 def debug_scan_docx_for_georgian(path: str, max_examples: int = 20) -> None:
-    """
-    Отладка: ищем оставшийся грузинский в DOCX.
-    """
+    """Отладка: ищем оставшийся грузинский в DOCX."""
     count = 0
     examples = []
 
@@ -423,10 +420,7 @@ def debug_scan_docx_for_georgian(path: str, max_examples: int = 20) -> None:
             t_tag = f"{{{ns}}}t"
 
             for p_index, p in enumerate(root.iter(p_tag)):
-                parts = []
-                for t in p.iter(t_tag):
-                    parts.append(t.text or "")
-                full_text = "".join(parts)
+                full_text = "".join([(t.text or "") for t in p.iter(t_tag)])
                 if not full_text:
                     continue
                 if GEORGIAN_RE.search(full_text):
@@ -461,7 +455,6 @@ def apply_translations_docx(
         for idx, info in enumerate(infos, start=1):
             fname = info.filename
             data = zin.read(fname)
-
             new_data = data
 
             if fname.startswith("word/") and fname.lower().endswith(".xml"):
@@ -491,9 +484,7 @@ def apply_translations_xlsx(
     start: float = 90.0,
     end: float = 100.0,
 ) -> None:
-    """
-    Безопасно применяет переводы к XLSX через openpyxl.
-    """
+    """Безопасно применяет переводы к XLSX через openpyxl."""
     from openpyxl import load_workbook
 
     wb = load_workbook(input_path, data_only=False)
@@ -573,7 +564,9 @@ def apply_translations_pptx(
     print(f"💾 PPTX сохранён: {output_path}, изменённых XML: {changed}")
 
 
-# ============ Переводчики (ChatGPT) ============
+# =============================================================================
+# ChatGPT перевод
+# =============================================================================
 
 def translate_with_chatgpt(
     fragments: List[str],
@@ -609,7 +602,6 @@ def translate_with_chatgpt(
     text_to_id: Dict[str, int] = {txt: i for i, txt in id_to_text.items()}
 
     print(f"Для перевода через ChatGPT подготовлено {len(unique_texts)} уникальных фрагментов.")
-
     fragments_struct: List[Dict[str, Any]] = [{"id": i, "text": txt} for i, txt in id_to_text.items()]
 
     batches = list(split_fragments_by_tokens(fragments_struct, max_tokens_per_batch=8000))
@@ -620,8 +612,6 @@ def translate_with_chatgpt(
     id_to_translated: Dict[int, str] = {}
 
     for batch_idx, batch in enumerate(batches, start=1):
-        batch_items = batch
-
         if progress_callback and total > 0:
             frac = done / total
             pct = start + (end - start) * frac
@@ -630,7 +620,7 @@ def translate_with_chatgpt(
         user_payload = {
             "source_language": "Georgian",
             "target_language": target_language,
-            "items": batch_items,
+            "items": batch,
         }
 
         system_msg = (
@@ -672,12 +662,7 @@ def translate_with_chatgpt(
                 time.sleep(delay_seconds)
 
         content = resp.choices[0].message.content
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            print("⚠️ Ошибка JSON от модели, ответ:")
-            print(content)
-            raise
+        data = json.loads(content)
 
         translations_list = data.get("translations")
         if not isinstance(translations_list, list):
@@ -696,7 +681,7 @@ def translate_with_chatgpt(
                 continue
             id_to_translated[tid_int] = ttext
 
-        done += len(batch_items)
+        done += len(batch)
         print(f"   ChatGPT перевёл {done}/{total} уникальных фрагментов (batch {batch_idx}/{len(batches)})")
 
         if progress_callback and total > 0:
@@ -777,22 +762,15 @@ def post_edit_with_chatgpt(
                 )
                 break
             except RateLimitError as e:
-                msg = str(e)
                 print(
                     f"[Post-edit batch {batch_idx}/{len(batches)}] "
-                    f"Перевышен лимит (попытка {attempt}/{max_retries}): {msg}"
+                    f"Перевышен лимит (попытка {attempt}/{max_retries}): {e}"
                 )
                 if attempt == max_retries:
                     raise
                 time.sleep(delay_seconds)
 
-        content = resp.choices[0].message.content
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            print("⚠️ Ошибка JSON от модели (вычитка), ответ:")
-            print(content)
-            raise
+        data = json.loads(resp.choices[0].message.content)
 
         for orig_text in batch:
             new_text = data.get(orig_text)
@@ -808,127 +786,18 @@ def post_edit_with_chatgpt(
 
     new_mapping: Dict[str, str] = {}
     for geo, raw_trans in mapping.items():
-        if isinstance(raw_trans, str):
-            new_mapping[geo] = improved_map.get(raw_trans, raw_trans)
-        else:
-            new_mapping[geo] = raw_trans
+        new_mapping[geo] = improved_map.get(raw_trans, raw_trans) if isinstance(raw_trans, str) else raw_trans
 
     return new_mapping
 
 
-def fix_spacing_with_chatgpt(
-    mapping: Dict[str, str],
-    model_name: str,
-    api_key: str,
-    progress_callback: Optional[Callable[[float, str], None]] = None,
-    start: float = 70.0,
-    end: float = 90.0,
-) -> Dict[str, str]:
-    from openai import OpenAI
+# =============================================================================
+# NLLB локальный переводчик (исправлена загрузка модели: оффлайн + автоскачивание при необходимости)
+# =============================================================================
 
-    os.environ["OPENAI_API_KEY"] = api_key
-    client = OpenAI()
-
-    unique_values: List[str] = []
-    seen = set()
-    for v in mapping.values():
-        if isinstance(v, str) and v.strip() and v not in seen:
-            seen.add(v)
-            unique_values.append(v)
-
-    if not unique_values:
-        return mapping
-
-    total = len(unique_values)
-    done = 0
-
-    batches = list(split_texts_by_tokens(unique_values, max_tokens_per_batch=8000))
-    print(f"[Fix-spacing] Будет отправлено {len(batches)} батч(ей) в модель {model_name}.")
-
-    fixed_map: Dict[str, str] = {}
-
-    system_msg = (
-        "You receive Russian texts which are already translated correctly. "
-        "Your ONLY task is to fix spacing errors: insert or delete ASCII space characters (U+0020) "
-        "where necessary between words, numbers and punctuation, and collapse multiple spaces to single ones if appropriate. "
-        "You MUST NOT change, delete, reorder or insert ANY non-space characters (letters, digits, punctuation). "
-        "Return ONLY a JSON object mapping each original string to its corrected version. "
-        "Keys MUST be EXACTLY the original strings. Do not add extra fields."
-    )
-
-    max_retries = 5
-    delay_seconds = 10
-
-    for batch_idx, batch in enumerate(batches, start=1):
-        if progress_callback and total > 0:
-            frac = done / total
-            pct = start + (end - start) * frac
-            progress_callback(pct, "Правка пробелов в русском тексте...")
-
-        user_payload = {"texts": batch}
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-                    ],
-                )
-                break
-            except RateLimitError as e:
-                msg = str(e)
-                print(
-                    f"[Fix-spacing batch {batch_idx}/{len(batches)}] "
-                    f"Перевышен лимит (попытка {attempt}/{max_retries}): {msg}"
-                )
-                if attempt == max_retries:
-                    raise
-                time.sleep(delay_seconds)
-
-        content = resp.choices[0].message.content
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            print("⚠️ Ошибка JSON от модели (fix_spacing), ответ:")
-            print(content)
-            raise
-
-        for orig_text in batch:
-            new_text = data.get(orig_text)
-            fixed_map[orig_text] = new_text.strip() if isinstance(new_text, str) and new_text.strip() else orig_text
-
-        done += len(batch)
-        print(f"   ChatGPT поправил пробелы в {done}/{total} фрагментах (batch {batch_idx}/{len(batches)})")
-
-        if progress_callback and total > 0:
-            frac = done / total
-            pct = start + (end - start) * frac
-            progress_callback(pct, "Правка пробелов в русском тексте...")
-
-    new_mapping: Dict[str, str] = {}
-    for geo, ru in mapping.items():
-        if isinstance(ru, str):
-            new_mapping[geo] = fixed_map.get(ru, ru)
-        else:
-            new_mapping[geo] = ru
-
-    return new_mapping
-
-
-# ============ Переводчик NLLB (локальный) — ЕДИНСТВЕННЫЙ БЛОК (без дублей) ============
-# Цель: приоритет "НИ ОДНОГО НЕПЕРЕВЕДЕННОГО КУСКА" (особенно грузинского),
-# при этом сохраняем цифры/даты/суммы через плейсхолдеры, но без жёсткого отката в оригинал.
-# + Нормализация VAT: "დღგ", "დღგ-ს" и ошибочное "ДН" -> "НДС"
-
-# Плейсхолдеры делаем "устойчивыми" к пробелам: __ PH 12 __ -> __PH12__
 _PH_RE_CANON = re.compile(r"__PH\d+__")
 _PH_RE_FUZZY = re.compile(r"__\s*PH\s*(\d+)\s*__")
-
-_RE_KA = re.compile(r"[\u10A0-\u10FF]")  # Georgian unicode block
-
+_RE_KA = re.compile(r"[\u10A0-\u10FF]")
 _RE_VAT_BAD_DN = re.compile(r"\bДН\b", re.IGNORECASE)
 _RE_VAT_KA = re.compile(r"(?:\b|\s)(დღგ)(?:-ს|-ის)?(?:\b)", flags=re.IGNORECASE)
 
@@ -957,34 +826,20 @@ def _normalize_spaces(s: str) -> str:
 
 
 def _fix_vat_terms(s: str) -> str:
-    """
-    Приводим VAT термины к "НДС":
-    - "ДН" -> "НДС"
-    - "დღგ", "დღგ-ს", "დღგ-ის" -> "НДС"
-    """
     if not isinstance(s, str) or not s:
         return s or ""
 
     s = _RE_VAT_BAD_DN.sub("НДС", s)
 
-    # заменяем грузинские формы НДС на "НДС" (с сохранением пробела/границы)
     def _vat_sub(m: re.Match) -> str:
-        # m.group(0) содержит ведущий пробел или границу, m.group(1) == "დღგ"
         return m.group(0).replace(m.group(1), "НДС")
 
     s = _RE_VAT_KA.sub(_vat_sub, s)
-
-    # подчистка редких артефактов, если вдруг получилось "НДС-с" / "НДС-ис"
     s = re.sub(r"\bНДС\s*-\s*(с|ис)\b", "НДС", s, flags=re.IGNORECASE)
     return s
 
 
 def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
-    """
-    Замораживаем уязвимые сущности, чтобы NLLB не портил номера/даты/суммы.
-    "Голые" числа — мягко: только 4+ цифры.
-    Дополнительно: замораживаем "დღგ(-ს/-ის)" чтобы не превращалось в "ДН".
-    """
     if not isinstance(text, str) or not text:
         return text, {}
 
@@ -992,7 +847,7 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
     idx = 0
 
     patterns = [
-        r"(?:\bდღგ(?:-ს|-ის)?\b)",  # VAT по-грузински -> потом нормализуем в "НДС"
+        r"(?:\bდღგ(?:-ს|-ис|-ის)?\b)",
         r"(?:(?:№|#|N)\s?\d+(?:[/-]\d+){0,3})",
         r"(?:\b(?:Art\.|Article|ст\.|Статья|п\.|пп\.|Пункт|параграф)\s*\d+(?:\.\d+){0,3}\b)",
         r"(?:\b\d+(?:\.\d+){1,4}\b)",
@@ -1007,9 +862,7 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
 
     def _sub(m: re.Match) -> str:
         nonlocal idx
-        s = m.group(0)
-        if not s:
-            return s
+        s = m.group(0) or ""
         s = _normalize_placeholders(s)
         if _PH_RE_CANON.fullmatch(s):
             return s
@@ -1026,17 +879,12 @@ def _unfreeze_legal_entities(text: str, repl: Dict[str, str]) -> str:
     if not isinstance(text, str) or not repl:
         return text
     out = _normalize_placeholders(text)
-    # Важно: плейсхолдеры могут повторяться, replace ок
     for k, v in repl.items():
         out = out.replace(k, v)
     return out
 
 
 def _sent_split_georgian(text: str) -> List[str]:
-    """
-    Мягкая нарезка для очень длинных абзацев.
-    НЕ режем после цифры и точки (4. / 13.4. и т.п.)
-    """
     if not text or len(text) <= 1200:
         return [text]
 
@@ -1057,7 +905,6 @@ def _sent_split_georgian(text: str) -> List[str]:
     if buf:
         chunks_out.append(buf)
 
-    # аварийная нарезка, если слишком много кусков
     if len(chunks_out) > 30:
         chunks_out = []
         step = 1000
@@ -1071,6 +918,37 @@ def _rejoin_translated(chunks_in: List[str]) -> str:
     return " ".join([c.strip() for c in chunks_in if c and c.strip()]).strip()
 
 
+def _load_nllb_tokenizer_and_model(
+    model_name: str,
+    src_lang: str,
+    device: torch.device,
+) -> Tuple[Any, Any]:
+    """
+    1) Пробуем строго OFFLINE + local_files_only=True
+    2) Если в кэше нет — временно ONLINE + скачиваем
+    3) Возвращаемся в OFFLINE
+    """
+    hf_enable_offline()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, src_lang=src_lang, local_files_only=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            local_files_only=True,
+            torch_dtype=torch.float16 if device.type == "cuda" else None,
+        ).to(device)
+        return tokenizer, model
+    except Exception:
+        hf_enable_online()
+        tokenizer = AutoTokenizer.from_pretrained(model_name, src_lang=src_lang, local_files_only=False)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            local_files_only=False,
+            torch_dtype=torch.float16 if device.type == "cuda" else None,
+        ).to(device)
+        hf_enable_offline()
+        return tokenizer, model
+
+
 def translate_with_local_model(
     fragments: List[str],
     direction_code: str,
@@ -1079,17 +957,13 @@ def translate_with_local_model(
     end: float = 60.0,
 ) -> Dict[str, str]:
     """
-    Максимально качественный локальный перевод NLLB-200-3.3B:
+    Качественный локальный перевод NLLB-200-3.3B:
     - beam search (num_beams=8)
-    - penalties для юридического текста
-    - защита чисел/дат/пунктов плейсхолдерами
-    - НЕ делаем жёсткий откат к оригиналу при "поломке" плейсхолдеров:
-      вместо этого: нормализация -> ретрай -> fallback на перевод без заморозки
-    - финальная гарантия: если после всего остался грузинский, делаем догоняющий перевод
-    - нет truncation=True (не режем смысл молча)
-    - VAT: "დღგ/დღგ-ს/დღг-ის" и "ДН" -> "НДС"
+    - защита чисел/дат/сумм плейсхолдерами
+    - без жёсткого отката в оригинал
+    - VAT: "დღგ/..." и "ДН" -> "НДС"
+    - если модель не скачана: 1 раз докачает, потом уйдёт в оффлайн
     """
-
     LANG_MAP = {"ka": "kat_Geor", "ru": "rus_Cyrl", "en": "eng_Latn"}
 
     if "-" not in direction_code:
@@ -1113,16 +987,12 @@ def translate_with_local_model(
     if progress_callback:
         progress_callback(start, f"Загрузка локальной модели NLLB ({MODEL_NAME})…")
     print(f"⏳ Загружаем локальную NLLB модель: {MODEL_NAME}")
-
-    enable_hf_offline()
+    hf_print_mode("[Before load] ")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        src_lang=SRC_LANG,
-        local_files_only=True,
-    )
+    tokenizer, model = _load_nllb_tokenizer_and_model(MODEL_NAME, SRC_LANG, device)
+    model.eval()
 
     if hasattr(tokenizer, "lang_code_to_id") and TGT_LANG in tokenizer.lang_code_to_id:
         forced_bos_id = tokenizer.lang_code_to_id[TGT_LANG]
@@ -1131,13 +1001,6 @@ def translate_with_local_model(
 
     if forced_bos_id is None or forced_bos_id < 0:
         raise RuntimeError(f"Не удалось получить token id для языка {TGT_LANG}")
-
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME,
-        local_files_only=True,
-        torch_dtype=torch.float16 if device.type == "cuda" else None,
-    ).to(device)
-    model.eval()
 
     gen_kwargs = dict(
         forced_bos_token_id=forced_bos_id,
@@ -1175,7 +1038,7 @@ def translate_with_local_model(
 
         batch_subchunks: List[List[str]] = []
         batch_freeze_meta: List[List[Dict[str, str]]] = []
-        batch_raw_pieces: List[List[str]] = []  # те же куски, но без заморозки (на случай fallback)
+        batch_raw_pieces: List[List[str]] = []
         batch_orig_texts: List[str] = []
 
         for orig in batch:
@@ -1198,9 +1061,7 @@ def translate_with_local_model(
         flat_out = _translate_texts(flat_texts)
 
         cursor = 0
-        for orig, pieces, metas, raw_pieces in zip(
-            batch_orig_texts, batch_subchunks, batch_freeze_meta, batch_raw_pieces
-        ):
+        for orig, pieces, metas, raw_pieces in zip(batch_orig_texts, batch_subchunks, batch_freeze_meta, batch_raw_pieces):
             piece_count = len(pieces)
             out_pieces = flat_out[cursor:cursor + piece_count]
             cursor += piece_count
@@ -1210,57 +1071,43 @@ def translate_with_local_model(
                 fp_norm = _normalize_placeholders(fp)
                 t = _normalize_placeholders((out_text or "").strip())
 
-                # 0) если вдруг модель вернула пусто — ретрай на этом же frozen-куске
                 if not t:
                     retry = _translate_texts([fp_norm])[0] if fp_norm else ""
                     t = retry if retry else ""
 
-                # 1) проверка плейсхолдеров (мягкая: требуем чтобы все "до" присутствовали "после")
                 ph_before = _placeholders_set(fp_norm)
                 ph_after = _placeholders_set(t)
 
                 if ph_before and (not ph_before.issubset(ph_after)):
-                    # ретрай №1: перевести этот frozen кусок отдельно (часто чинит)
                     retry = _translate_texts([fp_norm])[0] if fp_norm else ""
                     if retry:
                         t = retry
                         ph_after = _placeholders_set(t)
 
                 if ph_before and (not ph_before.issubset(ph_after)):
-                    # fallback: переводим исходный raw кусок (без заморозки)
-                    # приоритет: не оставить грузинский
                     retry_raw = _translate_texts([raw_p])[0] if raw_p else ""
                     if retry_raw:
                         t = retry_raw
 
-                # 2) разморозка того, что осталось (если плейсхолдеры сохранились)
                 t = _unfreeze_legal_entities(t, meta)
                 t = _normalize_spaces(t)
                 t = _fix_vat_terms(t)
 
-                # 3) финальная гарантия: если ka→(не ka) и остался грузинский — догоняем
                 if src == "ka" and tgt != "ka" and _has_ka(t):
                     repaired = _translate_texts([t])[0]
                     if repaired and not _has_ka(repaired):
-                        t = _normalize_spaces(repaired)
-                        t = _fix_vat_terms(t)
+                        t = _fix_vat_terms(_normalize_spaces(repaired))
 
-                # 4) если всё ещё грузинский — пытаемся перевести raw ещё раз
                 if src == "ka" and tgt != "ka" and _has_ka(t) and raw_p:
                     repaired2 = _translate_texts([raw_p])[0]
                     if repaired2:
-                        t = _normalize_spaces(repaired2)
-                        t = _fix_vat_terms(t)
+                        t = _fix_vat_terms(_normalize_spaces(repaired2))
 
-                unfrozen_pieces.append(
-                    t if t else _fix_vat_terms(_normalize_spaces(_unfreeze_legal_entities(fp_norm, meta)))
-                )
+                unfrozen_pieces.append(t if t else _fix_vat_terms(_normalize_spaces(_unfreeze_legal_entities(fp_norm, meta))))
 
-            merged = _rejoin_translated(unfrozen_pieces)
-            merged = _fix_vat_terms(_normalize_spaces(merged))
+            merged = _fix_vat_terms(_normalize_spaces(_rejoin_translated(unfrozen_pieces)))
 
             if src == "ka" and tgt != "ka" and _has_ka(merged):
-                # финальный общий догоняющий проход по склеенному абзацу
                 repaired = _translate_texts([merged])[0]
                 if repaired and not _has_ka(repaired):
                     merged = _fix_vat_terms(_normalize_spaces(repaired))
@@ -1271,10 +1118,8 @@ def translate_with_local_model(
         if progress_callback and total > 0:
             pct = start + (end - start) * (done / total)
             progress_callback(pct, f"Перевод локальной моделью (NLLB, {direction_code})…")
-
         print(f"   [NLLB {direction_code}] готово {done}/{total}")
 
-    # Итоговая проверка: сколько осталось грузинского в выходе
     if src == "ka" and tgt != "ka":
         left_ka = sum(1 for v in mapping.values() if _has_ka(v))
         if left_ka:
@@ -1285,7 +1130,49 @@ def translate_with_local_model(
     return mapping
 
 
-# ============ Локальная литературная вычитка (Qwen) ============
+# =============================================================================
+# Локальная вычитка Qwen (тоже с оффлайн + автоскачивание при необходимости)
+# =============================================================================
+
+def _load_qwen_tokenizer_and_model(model_name: str, device: torch.device):
+    hf_enable_offline()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=True)
+        if device.type == "cuda":
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                local_files_only=True,
+            ).to(device)
+        return tokenizer, model
+    except Exception:
+        hf_enable_online()
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=False)
+        if device.type == "cuda":
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                local_files_only=False,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                local_files_only=False,
+            ).to(device)
+        hf_enable_offline()
+        return tokenizer, model
+
 
 def post_edit_with_qwen_local(
     mapping: Dict[str, str],
@@ -1294,9 +1181,6 @@ def post_edit_with_qwen_local(
     start: float = 60.0,
     end: float = 90.0,
 ) -> Dict[str, str]:
-    """
-    Локальная литературная вычитка перевода с помощью Qwen2.5-3B-Instruct.
-    """
     MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
     unique_values: List[str] = []
@@ -1313,30 +1197,8 @@ def post_edit_with_qwen_local(
     if progress_callback:
         progress_callback(start, "Загрузка Qwen2.5-3B-Instruct для вычитки…")
 
-    enable_hf_offline()
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True,
-            local_files_only=True,
-        ).to(device)
-
+    tokenizer, model = _load_qwen_tokenizer_and_model(MODEL_NAME, device)
     model.eval()
 
     system_msg_text = (
@@ -1361,12 +1223,7 @@ def post_edit_with_qwen_local(
                 {"role": "system", "content": system_msg_text},
                 {"role": "user", "content": text},
             ]
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
             with torch.no_grad():
@@ -1378,11 +1235,7 @@ def post_edit_with_qwen_local(
 
             gen_ids = output_ids[0][inputs["input_ids"].shape[1]:]
             out_text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-            if not out_text:
-                out_text = text
-
-            improved_map[text] = out_text
+            improved_map[text] = out_text if out_text else text
 
         done += len(batch)
         if progress_callback and total > 0:
@@ -1394,15 +1247,14 @@ def post_edit_with_qwen_local(
 
     new_mapping: Dict[str, str] = {}
     for geo, raw_trans in mapping.items():
-        if isinstance(raw_trans, str):
-            new_mapping[geo] = improved_map.get(raw_trans, raw_trans)
-        else:
-            new_mapping[geo] = raw_trans
+        new_mapping[geo] = improved_map.get(raw_trans, raw_trans) if isinstance(raw_trans, str) else raw_trans
 
     return new_mapping
 
 
-# ============ Простая правка пробелов (регэксы) ============
+# =============================================================================
+# Простейшая правка пробелов (если нужно)
+# =============================================================================
 
 def normalize_segment_boundaries(segments: List[str]) -> List[str]:
     if len(segments) <= 1:
@@ -1424,25 +1276,22 @@ def normalize_segment_boundaries(segments: List[str]) -> List[str]:
 
 def fix_basic_spacing_ru(text: str) -> str:
     text = text.replace("\u00A0", " ")
-
     text = re.sub(r'([А-ЯЁа-яё])№\s*(\d)', r'\1 №\2', text)
     text = re.sub(r'№\s*(\d)', r'№ \1', text)
-
     text = re.sub(r'(?i)\b(от|до|по|на|в|к|с|у)(\d)', r'\1 \2', text)
     text = re.sub(r'(\d)([А-ЯЁа-яё])', r'\1 \2', text)
     text = re.sub(r'(\d{3,4})\s*(год[ауе]?|гг?\.?)', r'\1 \2', text)
-
     text = re.sub(r',([^\s])', r', \1', text)
     text = re.sub(r';([^\s])', r'; \1', text)
     text = re.sub(r'([^.])\.([А-ЯЁ])', r'\1. \2', text)
-
     text = re.sub(r'(%)([А-ЯЁа-яё])', r'\1 \2', text)
     text = re.sub(r'[ \t]{2,}', ' ', text)
-
     return text
 
 
-# ============ Логика перевода одного файла ============
+# =============================================================================
+# Логика перевода одного файла
+# =============================================================================
 
 def process_file(
     file_path: str,
@@ -1552,6 +1401,7 @@ def process_file(
                 end=90.0,
             )
 
+    # DOCX: нужно сопоставление id параграфа -> перевод
     if is_docx(file_path):
         id_mapping: Dict[str, str] = {}
         for it in items_for_docx:  # type: ignore
@@ -1560,7 +1410,7 @@ def process_file(
             translated = mapping_text_to_trans.get(clean_text, clean_text)
             id_mapping[item_id] = translated
     else:
-        id_mapping = mapping_text_to_trans
+        id_mapping = {}  # не используется для xlsx/pptx
 
     base, ext = os.path.splitext(file_path)
     output_path = f"{base}{suffix}{ext}"
@@ -1587,10 +1437,11 @@ def process_file(
             end=100.0,
         )
     else:
+        # ВАЖНО: тут нужно передавать именно mapping_text_to_trans, а не id_mapping
         apply_translations_xlsx(
             file_path,
             output_path,
-            id_mapping,
+            mapping_text_to_trans,
             progress_callback=progress_callback,
             start=90.0,
             end=100.0,
@@ -1604,7 +1455,9 @@ def process_file(
     return output_path
 
 
-# ============ GUI (Tkinter) ============
+# =============================================================================
+# GUI (Tkinter)
+# =============================================================================
 
 class TranslatorGUI:
     def __init__(self, root: tk.Tk):
@@ -1624,6 +1477,13 @@ class TranslatorGUI:
 
         self.start_button: Optional[ttk.Button] = None
         self.post_edit_check: Optional[ttk.Checkbutton] = None
+
+        self.direction_combo: Optional[ttk.Combobox] = None
+        self.model_combo: Optional[ttk.Combobox] = None
+        self.env_entry: Optional[ttk.Entry] = None
+        self.env_button: Optional[ttk.Button] = None
+        self.progress_bar: Optional[ttk.Progressbar] = None
+        self.status_label: Optional[ttk.Label] = None
 
         self.build_ui()
 
@@ -1739,23 +1599,23 @@ class TranslatorGUI:
     def on_translator_change(self):
         kind = self.translator_var.get()
         if kind == "chatgpt":
-            self.model_combo.configure(state="readonly")
-            self.env_entry.configure(state="normal")
-            self.env_button.configure(state="normal")
+            if self.model_combo is not None:
+                self.model_combo.configure(state="readonly")
+            if self.env_entry is not None:
+                self.env_entry.configure(state="normal")
+            if self.env_button is not None:
+                self.env_button.configure(state="normal")
             if self.post_edit_check is not None:
-                self.post_edit_check.configure(
-                    text="Литературная вычитка (через ChatGPT)",
-                    state="normal",
-                )
+                self.post_edit_check.configure(text="Литературная вычитка (через ChatGPT)", state="normal")
         else:
-            self.model_combo.configure(state="disabled")
-            self.env_entry.configure(state="disabled")
-            self.env_button.configure(state="disabled")
+            if self.model_combo is not None:
+                self.model_combo.configure(state="disabled")
+            if self.env_entry is not None:
+                self.env_entry.configure(state="disabled")
+            if self.env_button is not None:
+                self.env_button.configure(state="disabled")
             if self.post_edit_check is not None:
-                self.post_edit_check.configure(
-                    text="Литературная вычитка (локальная Qwen2.5-3B-Instruct)",
-                    state="normal",
-                )
+                self.post_edit_check.configure(text="Литературная вычитка (локальная Qwen2.5-3B-Instruct)", state="normal")
 
     def run_translation(self):
         file_path = self.file_path_var.get().strip()
@@ -1783,7 +1643,8 @@ class TranslatorGUI:
             messagebox.showerror("Ошибка", "Выберите .env файл с токеном для ChatGPT.")
             return
 
-        self.start_button.configure(state="disabled")
+        if self.start_button is not None:
+            self.start_button.configure(state="disabled")
         self.set_progress(0.0, "Начало обработки...")
 
         t = threading.Thread(
@@ -1819,7 +1680,8 @@ class TranslatorGUI:
             err_msg = f"{type(e).__name__}: {e}"
 
             def show_error(msg=err_msg):
-                self.start_button.configure(state="normal")
+                if self.start_button is not None:
+                    self.start_button.configure(state="normal")
                 self._update_progress_mainthread(0.0, "Ошибка.")
                 messagebox.showerror("Ошибка", f"Перевод завершился с ошибкой:\n{msg}")
 
@@ -1827,7 +1689,8 @@ class TranslatorGUI:
             return
 
         def on_done():
-            self.start_button.configure(state="normal")
+            if self.start_button is not None:
+                self.start_button.configure(state="normal")
             self._update_progress_mainthread(100.0, "Готово.")
             messagebox.showinfo("Готово", f"Файл переведён:\n{output_path}")
 
