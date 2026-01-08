@@ -919,12 +919,29 @@ def fix_spacing_with_chatgpt(
 
 
 # ============ Переводчик NLLB (локальный) — ЕДИНСТВЕННЫЙ БЛОК (без дублей) ============
+# Цель: приоритет "НИ ОДНОГО НЕПЕРЕВЕДЕННОГО КУСКА" (особенно грузинского),
+# при этом сохраняем цифры/даты/суммы через плейсхолдеры, но без жёсткого отката в оригинал.
 
-_PH_RE_LOCAL = re.compile(r"__PH\d+__")
+# Плейсхолдеры делаем "устойчивыми" к пробелам: __ PH 12 __ -> __PH12__
+_PH_RE_CANON = re.compile(r"__PH\d+__")
+_PH_RE_FUZZY = re.compile(r"__\s*PH\s*(\d+)\s*__")
+
+_RE_KA = re.compile(r"[\u10A0-\u10FF]")  # Georgian unicode block
+
+
+def _has_ka(s: str) -> bool:
+    return bool(_RE_KA.search(s or ""))
+
+
+def _normalize_placeholders(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return s or ""
+    return _PH_RE_FUZZY.sub(lambda m: f"__PH{m.group(1)}__", s)
 
 
 def _placeholders_set(s: str) -> set:
-    return set(_PH_RE_LOCAL.findall(s or ""))
+    s = _normalize_placeholders(s or "")
+    return set(_PH_RE_CANON.findall(s))
 
 
 def _normalize_spaces(s: str) -> str:
@@ -964,7 +981,8 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
         s = m.group(0)
         if not s:
             return s
-        if _PH_RE_LOCAL.fullmatch(s):
+        s = _normalize_placeholders(s)
+        if _PH_RE_CANON.fullmatch(s):
             return s
         key = f"__PH{idx}__"
         idx += 1
@@ -978,7 +996,8 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
 def _unfreeze_legal_entities(text: str, repl: Dict[str, str]) -> str:
     if not isinstance(text, str) or not repl:
         return text
-    out = text
+    out = _normalize_placeholders(text)
+    # Важно: плейсхолдеры могут повторяться, replace ок
     for k, v in repl.items():
         out = out.replace(k, v)
     return out
@@ -1009,6 +1028,7 @@ def _sent_split_georgian(text: str) -> List[str]:
     if buf:
         chunks_out.append(buf)
 
+    # аварийная нарезка, если слишком много кусков
     if len(chunks_out) > 30:
         chunks_out = []
         step = 1000
@@ -1034,7 +1054,9 @@ def translate_with_local_model(
     - beam search (num_beams=8)
     - penalties для юридического текста
     - защита чисел/дат/пунктов плейсхолдерами
-    - проверка плейсхолдеров (если сломались — откат к оригиналу куска)
+    - НЕ делаем жёсткий откат к оригиналу при "поломке" плейсхолдеров:
+      вместо этого: нормализация -> ретрай -> fallback на перевод без заморозки
+    - финальная гарантия: если после всего остался грузинский, делаем догоняющий перевод
     - нет truncation=True (не режем смысл молча)
     """
 
@@ -1090,18 +1112,29 @@ def translate_with_local_model(
     gen_kwargs = dict(
         forced_bos_token_id=forced_bos_id,
         do_sample=False,
-        num_beams=8,              # максимальнее по качеству (медленнее)
+        num_beams=8,
         length_penalty=1.1,
         no_repeat_ngram_size=3,
         repetition_penalty=1.05,
         early_stopping=True,
         use_cache=True,
-        max_new_tokens=1024,      # чтобы почти никогда не обрезало длинные абзацы
+        max_new_tokens=1024,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
 
     BATCH_SIZE = 4 if device.type == "cuda" else 1
+
+    def _translate_texts(texts: List[str]) -> List[str]:
+        if not texts:
+            return []
+        tokenizer.src_lang = SRC_LANG
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=False)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            generated = model.generate(**inputs, **gen_kwargs)
+        outs = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        return [_normalize_placeholders((o or "").strip()) for o in outs]
 
     total = len(remaining)
     done = 0
@@ -1112,65 +1145,90 @@ def translate_with_local_model(
 
         batch_subchunks: List[List[str]] = []
         batch_freeze_meta: List[List[Dict[str, str]]] = []
+        batch_raw_pieces: List[List[str]] = []   # те же куски, но без заморозки (на случай fallback)
         batch_orig_texts: List[str] = []
 
         for orig in batch:
             batch_orig_texts.append(orig)
 
             pieces = _sent_split_georgian(orig)
+            batch_raw_pieces.append(pieces)
 
             frozen_pieces: List[str] = []
             metas: List[Dict[str, str]] = []
             for p in pieces:
                 fp, meta = _freeze_legal_entities(p)
-                frozen_pieces.append(fp)
+                frozen_pieces.append(_normalize_placeholders(fp))
                 metas.append(meta)
 
             batch_subchunks.append(frozen_pieces)
             batch_freeze_meta.append(metas)
 
         flat_texts: List[str] = [p for pieces in batch_subchunks for p in pieces]
-
-        tokenizer.src_lang = SRC_LANG
-        inputs = tokenizer(
-            flat_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            generated = model.generate(**inputs, **gen_kwargs)
-
-        flat_out = tokenizer.batch_decode(generated, skip_special_tokens=True)
+        flat_out = _translate_texts(flat_texts)
 
         cursor = 0
-        for orig, pieces, metas in zip(batch_orig_texts, batch_subchunks, batch_freeze_meta):
+        for orig, pieces, metas, raw_pieces in zip(
+            batch_orig_texts, batch_subchunks, batch_freeze_meta, batch_raw_pieces
+        ):
             piece_count = len(pieces)
             out_pieces = flat_out[cursor:cursor + piece_count]
             cursor += piece_count
 
             unfrozen_pieces: List[str] = []
-            for fp, out_text, meta in zip(pieces, out_pieces, metas):
-                t = (out_text or "").strip()
+            for fp, out_text, meta, raw_p in zip(pieces, out_pieces, metas, raw_pieces):
+                fp_norm = _normalize_placeholders(fp)
+                t = _normalize_placeholders((out_text or "").strip())
 
+                # 0) если вдруг модель вернула пусто — ретрай на этом же frozen-куске
                 if not t:
-                    t = _unfreeze_legal_entities(fp, meta)
-                    unfrozen_pieces.append(_normalize_spaces(t))
-                    continue
+                    retry = _translate_texts([fp_norm])[0] if fp_norm else ""
+                    t = retry if retry else ""
 
-                ph_before = _placeholders_set(fp)
+                # 1) проверка плейсхолдеров (мягкая: требуем чтобы все "до" присутствовали "после")
+                ph_before = _placeholders_set(fp_norm)
                 ph_after = _placeholders_set(t)
-                if ph_before != ph_after:
-                    t = _unfreeze_legal_entities(fp, meta)  # откат на исходник куска
-                    unfrozen_pieces.append(_normalize_spaces(t))
-                    continue
 
+                if ph_before and (not ph_before.issubset(ph_after)):
+                    # ретрай №1: перевести этот frozen кусок отдельно (часто чинит)
+                    retry = _translate_texts([fp_norm])[0] if fp_norm else ""
+                    if retry:
+                        t = retry
+                        ph_after = _placeholders_set(t)
+
+                if ph_before and (not ph_before.issubset(ph_after)):
+                    # fallback: переводим исходный raw кусок (без заморозки)
+                    # приоритет: не оставить грузинский
+                    retry_raw = _translate_texts([raw_p])[0] if raw_p else ""
+                    if retry_raw:
+                        t = retry_raw
+
+                # 2) разморозка того, что осталось (если плейсхолдеры сохранились)
                 t = _unfreeze_legal_entities(t, meta)
-                unfrozen_pieces.append(_normalize_spaces(t))
+                t = _normalize_spaces(t)
+
+                # 3) финальная гарантия: если ka→(не ka) и остался грузинский — догоняем
+                if src == "ka" and tgt != "ka" and _has_ka(t):
+                    repaired = _translate_texts([t])[0]
+                    if repaired and not _has_ka(repaired):
+                        t = _normalize_spaces(repaired)
+
+                # 4) в крайнем случае (совсем провал) — всё равно НЕ возвращаем грузинский кусок
+                # если это ka→ru и t всё ещё грузинский, пытаемся перевести raw ещё раз
+                if src == "ka" and tgt != "ka" and _has_ka(t) and raw_p:
+                    repaired2 = _translate_texts([raw_p])[0]
+                    if repaired2:
+                        t = _normalize_spaces(repaired2)
+
+                unfrozen_pieces.append(t if t else _normalize_spaces(_unfreeze_legal_entities(fp_norm, meta)))
 
             merged = _rejoin_translated(unfrozen_pieces)
+            if src == "ka" and tgt != "ka" and _has_ka(merged):
+                # финальный общий догоняющий проход по склеенному абзацу
+                repaired = _translate_texts([merged])[0]
+                if repaired and not _has_ka(repaired):
+                    merged = _normalize_spaces(repaired)
+
             mapping[orig] = merged if merged else orig
 
         done += len(batch)
@@ -1179,6 +1237,14 @@ def translate_with_local_model(
             progress_callback(pct, f"Перевод локальной моделью (NLLB, {direction_code})…")
 
         print(f"   [NLLB {direction_code}] готово {done}/{total}")
+
+    # Итоговая проверка: сколько осталось грузинского в выходе
+    if src == "ka" and tgt != "ka":
+        left_ka = sum(1 for v in mapping.values() if _has_ka(v))
+        if left_ka:
+            print(f"⚠️ Остались фрагменты с грузинским: {left_ka}/{len(mapping)}")
+        else:
+            print("✅ Грузинских фрагментов в результате не осталось")
 
     return mapping
 
