@@ -141,6 +141,12 @@ TELASI_KA_FORMS = ["თელასი", "თელასი-ს", "თელა
 # Утилиты
 # =============================================================================
 
+def has_georgian(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(re.search(r"[\u10A0-\u10FF\u1C90-\u1CBF]", text))
+
+
 def is_docx(path: str) -> bool:
     return path.lower().endswith(".docx")
 
@@ -209,6 +215,13 @@ _RE_DEPT_DEFENSE = re.compile(r"\bДепартамент\s+обороны\b", re
 
 _RE_DIGIT_PAREN = re.compile(r"(\b\d{1,3}\b)\s*\(\s*([^)]+?)\s*\)")
 
+# Заголовок + номер в конце: "Состав ... 2."
+_RE_TITLE_END_NUM = re.compile(r"^([^\n\r]{3,120}?)\s+(\d{1,2})\.\s*$")
+
+# Падежи (точечные юридические коллокации)
+_RE_SAFE_OBJ = re.compile(r"\b(безопасност[ьи]|охран[ауе]|защит[ауе])\s+Объект\b", re.IGNORECASE)
+_RE_SAFE_OBJ2 = re.compile(r"\b(безопасност[ьи]|охран[ауе]|защит[ауе])\s+объект\b", re.IGNORECASE)
+
 
 def _has_ka(s: str) -> bool:
     return bool(_RE_KA_BLOCK.search(s or ""))
@@ -218,7 +231,13 @@ def _normalize_spaces(s: str) -> str:
     if not isinstance(s, str):
         return ""
     s = s.replace("\u00A0", " ")
+    # пробел перед запятой/точкой — убрать
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    # много пробелов -> один
     s = re.sub(r"[ \t]{2,}", " ", s)
+    # пробелы вокруг кавычек-ёлочек/грузинских кавычек
+    s = re.sub(r"[ \t]+([”»])", r"\1", s)
+    s = re.sub(r"([„«])\s+", r"\1", s)
     return s.strip()
 
 
@@ -239,6 +258,9 @@ def apply_term_normalization(text: str) -> str:
         s = re.sub(re.escape(f), CANON_TELMICO_RU, s, flags=re.IGNORECASE)
     for f in TELASI_KA_FORMS:
         s = re.sub(re.escape(f), CANON_TELASI_RU, s, flags=re.IGNORECASE)
+
+    # Фикс типовой опечатки "Стбилисская" -> "Тбилисская"
+    s = re.sub(r"(?i)\bСтбилисская\b", "Тбилисская", s)
 
     # nonsense -> нормальный юридический термин
     s = _RE_NONSENSE_PIRG.sub("неустойка", s)
@@ -329,10 +351,68 @@ def sanitize_junk_artifacts(text: str) -> str:
     return _normalize_spaces(s)
 
 
+def fix_heading_number_order_ru(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text or ""
+    s = text.strip()
+    m = _RE_TITLE_END_NUM.match(s)
+    if not m:
+        return text
+    title = m.group(1).strip()
+    num = m.group(2)
+    if title.count(".") <= 1 and len(title.split()) <= 14:
+        return f"{num}. {title}"
+    return text
+
+
+def fix_cases_ru(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text or ""
+    s = text
+    s = _RE_SAFE_OBJ.sub(lambda m: f"{m.group(1)} Объекта", s)
+    s = _RE_SAFE_OBJ2.sub(lambda m: f"{m.group(1)} объекта", s)
+    return _normalize_spaces(s)
+
+
+def fix_legal_templates_ru(text: str) -> str:
+    """
+    Жёсткие шаблоны под юридическую формулу — лечит:
+    - "Договорпредставлено ... на грузине"
+    - "связанная с Договор" -> "с Договором"
+    """
+    if not isinstance(text, str) or not text:
+        return text or ""
+
+    s = text
+
+    # слепление
+    s = re.sub(r"\bДоговорпредставлено\b", "Договор представлен", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bДоговорпредставлен\b", "Договор представлен", s, flags=re.IGNORECASE)
+
+    # падеж "с Договор"
+    s = re.sub(r"(?i)\bсвязанн?ая\s+с\s+Договор\b", "связанная с Договором", s)
+    s = re.sub(r"(?i)\bсвяза[нн]ая\s+с\s+Договор\b", "связанная с Договором", s)
+
+    # "на грузине" и прочие
+    s = re.sub(r"(?i)\bна\s+грузине\b", "на грузинском языке", s)
+
+    # если это именно тот блок про язык договора — нормализуем целиком (самый безопасный фикс)
+    low = s.lower()
+    if ("договор" in low) and ("грузинск" in low) and ("надп" in low):
+        # не трогаем, если рядом уже явно "грузинском языке" и "Договором"
+        if "грузинском языке" not in s or "Договором" not in s:
+            s = "Договор составлен на грузинском языке, и любая надпись, связанная с Договором, должна быть выполнена на грузинском языке."
+
+    return _normalize_spaces(s)
+
+
 def apply_post_pipeline_ru(text: str) -> str:
     s = apply_term_normalization(text)
     s = fix_digit_word_mismatch_ru(s)
     s = sanitize_junk_artifacts(s)
+    s = fix_heading_number_order_ru(s)
+    s = fix_cases_ru(s)
+    s = fix_legal_templates_ru(s)
     return _normalize_spaces(s)
 
 
@@ -365,7 +445,7 @@ def collect_docx_items(path: str) -> List[Dict[str, object]]:
                 full_text = "".join([(t.text or "") for t in t_elems])
                 if not full_text:
                     continue
-                if not GEORGIAN_RE.search(full_text):
+                if not has_georgian(full_text):
                     continue
                 clean_text = full_text.strip()
                 if not clean_text:
@@ -405,10 +485,13 @@ def process_docx_xml_paragraphs(xml_bytes: bytes, xml_name: str, id_mapping: Dic
         orig_full = "".join([(t.text or "") for t in t_elems])
         if not orig_full:
             continue
-        if not GEORGIAN_RE.search(orig_full):
+        if not has_georgian(orig_full):
             continue
 
         translated_clean = id_mapping[para_id]
+        # дополнительный финальный постпроцесс на всякий
+        translated_clean = apply_post_pipeline_ru(translated_clean)
+
         lead = len(orig_full) - len(orig_full.lstrip())
         trail = len(orig_full) - len(orig_full.rstrip())
         prefix = orig_full[:lead]
@@ -475,7 +558,7 @@ def debug_scan_docx_for_georgian(path: str, max_examples: int = 20) -> None:
             t_tag = f"{{{ns}}}t"
             for p_index, p in enumerate(root.iter(p_tag)):
                 full_text = "".join([(t.text or "") for t in p.iter(t_tag)])
-                if full_text and GEORGIAN_RE.search(full_text):
+                if full_text and has_georgian(full_text):
                     count += 1
                     if len(examples) < max_examples:
                         snippet = full_text.strip()
@@ -504,7 +587,7 @@ def collect_xlsx_cell_items(path: str) -> List[Dict[str, Any]]:
                     continue
                 if v.startswith("="):
                     continue
-                if not GEORGIAN_RE.search(v):
+                if not has_georgian(v):
                     continue
                 clean = v.strip()
                 if not clean:
@@ -547,6 +630,8 @@ def apply_translations_xlsx_cells(
                     continue
 
                 translated_clean = id_mapping[item_id]
+                translated_clean = apply_post_pipeline_ru(translated_clean)
+
                 lead = len(v) - len(v.lstrip())
                 trail = len(v) - len(v.rstrip())
                 prefix = v[:lead]
@@ -570,21 +655,17 @@ A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
 def collect_pptx_paragraph_items(path: str) -> List[Dict[str, Any]]:
+    """
+    ВАЖНО: индекс p_index должен считаться для КАЖДОГО a:p (как при применении),
+    иначе id_mapping не совпадёт и часть текста останется непереведённой.
+    """
     items: List[Dict[str, Any]] = []
     with zipfile.ZipFile(path, "r") as zin:
         for info in zin.infolist():
             fname = info.filename
             low = fname.lower()
             if not (low.startswith("ppt/") and low.endswith(".xml")):
-                continue
-            if not (
-                low.startswith("ppt/slides/")
-                or low.startswith("ppt/notesslides/")
-                or low.startswith("ppt/slidelayouts/")
-                or low.startswith("ppt/slidemasters/")
-                or low == "ppt/presentation.xml"
-            ):
-                continue
+                continue  # берем все ppt/**/*.xml — диаграммы/smartart/charts тоже
 
             xml_bytes = zin.read(fname)
             try:
@@ -598,22 +679,17 @@ def collect_pptx_paragraph_items(path: str) -> List[Dict[str, Any]]:
             p_index = 0
             for p in root.iter(p_tag):
                 t_elems = list(p.iter(t_tag))
-                if not t_elems:
-                    continue
-                full_text = "".join([(t.text or "") for t in t_elems])
-                if not full_text or not GEORGIAN_RE.search(full_text):
-                    continue
-                clean = full_text.strip()
-                if not clean:
-                    continue
-
-                items.append({
-                    "id": f"{fname}::p{p_index}",
-                    "xml_name": fname,
-                    "p_index": p_index,
-                    "full_text": full_text,
-                    "clean_text": clean,
-                })
+                full_text = "".join([(t.text or "") for t in t_elems]) if t_elems else ""
+                if full_text and has_georgian(full_text):
+                    clean = full_text.strip()
+                    if clean:
+                        items.append({
+                            "id": f"{fname}::p{p_index}",
+                            "xml_name": fname,
+                            "p_index": p_index,
+                            "full_text": full_text,
+                            "clean_text": clean,
+                        })
                 p_index += 1
 
     print(f"📽️ PPTX: найдено {len(items)} абзацев (a:p) с грузинским.")
@@ -634,14 +710,18 @@ def process_pptx_xml_paragraphs(xml_bytes: bytes, xml_name: str, id_mapping: Dic
         para_id = f"{xml_name}::p{p_index}"
         t_elems = list(p.iter(t_tag))
         if not t_elems:
+            p_index += 1
             continue
 
         full_text = "".join([(t.text or "") for t in t_elems])
         if not full_text:
+            p_index += 1
             continue
 
-        if para_id in id_mapping and GEORGIAN_RE.search(full_text):
+        if para_id in id_mapping and has_georgian(full_text):
             translated_clean = id_mapping[para_id]
+            translated_clean = apply_post_pipeline_ru(translated_clean)
+
             lead = len(full_text) - len(full_text.lstrip())
             trail = len(full_text) - len(full_text.rstrip())
             prefix = full_text[:lead]
@@ -692,8 +772,36 @@ def apply_translations_pptx_paragraphs(
     print(f"💾 PPTX сохранён: {output_path}, изменённых XML: {changed}")
 
 
+def debug_scan_pptx_for_georgian(path: str, max_examples: int = 30) -> None:
+    count = 0
+    examples = []
+    with zipfile.ZipFile(path, "r") as zin:
+        for info in zin.infolist():
+            low = info.filename.lower()
+            if not (low.startswith("ppt/") and low.endswith(".xml")):
+                continue
+            xml_bytes = zin.read(info.filename)
+            try:
+                root = ET.fromstring(xml_bytes)
+            except Exception:
+                continue
+            t_tag = f"{{{A_NS}}}t"
+            for t in root.iter(t_tag):
+                txt = (t.text or "")
+                if txt and has_georgian(txt):
+                    count += 1
+                    if len(examples) < max_examples:
+                        sn = txt.strip()
+                        if len(sn) > 120:
+                            sn = sn[:117] + "..."
+                        examples.append((info.filename, sn))
+    print(f"🔍 PPTX осталось грузинского: {count}")
+    for fn, sn in examples:
+        print(f"  - {fn}: {sn}")
+
+
 # =============================================================================
-# NLLB локальный переводчик (вариант A: абзац/параграф целиком + словарь терминов)
+# NLLB локальный переводчик (макс качество: плейсхолдеры + разбиение + строгие проверки)
 # =============================================================================
 
 _PH_RE_CANON = re.compile(r"__PH\d+__")
@@ -714,7 +822,10 @@ def _placeholders_set(s: str) -> set:
 
 def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
     """
-    КРИТИЧЕСКОЕ: фиксированные юр-термины (ka->ru) под плейсхолдер, чтобы NLLB НЕ мог сорваться.
+    КРИТИЧЕСКОЕ: фиксированные юр-термины и названия под плейсхолдер, чтобы NLLB НЕ портил:
+    - термины, роли ("დამკვეთი"), слово "ხელშეკრულება"
+    - название компании на грузинском
+    - числа/даты/номера/валюты
     """
     if not isinstance(text, str) or not text:
         return text, {}
@@ -724,7 +835,11 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
 
     # --- фиксированные термины (ka -> ru), с поддержкой грузинских кавычек „…“
     fixed_terms: List[Tuple[re.Pattern, str]] = [
+        # обычный "დამკვეთი"
         (re.compile(r'(?<!\w)([„"«]?)\s*დამკვეთი\s*([”"»]?)', re.IGNORECASE), "Заказчик"),
+        # иногда Word рвёт буквы/пробелы (жёсткая эвристика)
+        (re.compile(r'(?i)([„"«]?)\s*დ\s*ა\s*მ\s*კ\s*ვ\s*ე\s*თ\s*ი\s*([”"»]?)'), "Заказчик"),
+
         (re.compile(r'(?<!\w)([„"«]?)\s*შემსრულებელი\s*([”"»]?)', re.IGNORECASE), "Исполнитель"),
         (re.compile(r'(?<!\w)([„"«]?)\s*ხელშეკრულება\s*([”"»]?)', re.IGNORECASE), "Договор"),
         (re.compile(r'(?<!\w)([„"«]?)\s*მხარეები\s*([”"»]?)', re.IGNORECASE), "Стороны"),
@@ -732,12 +847,18 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
         (re.compile(r'(?<!\w)([„"«]?)\s*საგარანტიო\s+თანხა\s*([”"»]?)', re.IGNORECASE), "гарантийная сумма"),
         (re.compile(r'(?<!\w)([„"«]?)\s*პირგასამტეხლო\s*([”"»]?)', re.IGNORECASE), "неустойка"),
         (re.compile(r'(?<!\w)([„"«]?)\s*საურავი\s*([”"»]?)', re.IGNORECASE), "пеня"),
+
+        # Название компании на грузинском (чтобы NLLB не делал "Стбилисская")
+        (re.compile(r'(?i)[„"«]?\s*თბილისის\s+ელექტრომიმწოდებელი\s+კომპანია\s*[”"»]?'), 'Тбилисская электроснабжающая компания'),
     ]
 
     def _sub_fixed(m: re.Match, replacement_ru: str) -> str:
         nonlocal idx
-        left_q = m.group(1) or ""
-        right_q = m.group(2) or ""
+        # если паттерн имеет 2 группы кавычек — сохраняем их, иначе просто подставим replacement
+        left_q = m.group(1) if m.lastindex and m.lastindex >= 1 else ""
+        right_q = m.group(2) if m.lastindex and m.lastindex >= 2 else ""
+        left_q = left_q or ""
+        right_q = right_q or ""
         key = f"__PH{idx}__"
         idx += 1
         repl[key] = f"{left_q}{replacement_ru}{right_q}"
@@ -747,11 +868,11 @@ def _freeze_legal_entities(text: str) -> Tuple[str, Dict[str, str]]:
     for rx, ru_term in fixed_terms:
         s = rx.sub(lambda m, ru_term=ru_term: _sub_fixed(m, ru_term), s)
 
-    # --- остальное (числа/даты/НДС/имена/ТЭЛМИКО/Теласи)
+    # --- остальное (числа/даты/НДС/имена/ТЭЛМИКО/Теласи/номера)
     patterns = [
         r"(?:\bდღგ(?:-ს|-ის)?\b)",
         r"(?:\bთელმიკო(?:-ს|-ის|-სთვის)?\b)",
-        r"(?:\bთელასი(?:-ს|-ის|-სთვის)?\b)",
+        r"(?:\bთელასი(?:-с|-is|-ს|-ის|-სთვის)?\b)",
         r"(?:\bТЭЛМИКО\b)",
         r"(?:\bТеласи\b)",
         r"(?:(?:№|#|N)\s?\d+(?:[/-]\d+){0,3})",
@@ -811,7 +932,8 @@ def _split_with_separators(text: str, max_len: int = 2200, soft_limit: int = 200
     if buf_start < len(text):
         out.append((text[buf_start:], ""))
 
-    if len(out) > 40 or (len(out) == 1 and len(out[0][0]) > max_len * 2):
+    # жёсткий fallback для очень длинных кусков
+    if len(out) > 60 or (len(out) == 1 and len(out[0][0]) > max_len * 2):
         out = []
         step = 1800
         i = 0
@@ -896,13 +1018,14 @@ def translate_with_local_model(
     if forced_bos_id is None or forced_bos_id < 0:
         raise RuntimeError(f"Не удалось получить token id для языка {TGT_LANG}")
 
+    # Генерация: качественно, но без чрезмерного "раздувания"
     gen_kwargs = dict(
         forced_bos_token_id=forced_bos_id,
         do_sample=False,
-        num_beams=8,
-        length_penalty=1.1,
+        num_beams=10 if device.type == "cuda" else 9,
+        length_penalty=1.08,
         no_repeat_ngram_size=3,
-        repetition_penalty=1.05,
+        repetition_penalty=1.06,
         early_stopping=True,
         use_cache=True,
         max_new_tokens=1024,
@@ -976,6 +1099,7 @@ def translate_with_local_model(
                         t = retry
                         ph_after = _placeholders_set(t)
 
+                # если всё равно не сошлось — fallback на raw
                 if ph_before and (ph_before != ph_after):
                     retry_raw = _translate_texts([raw_p])[0] if raw_p else ""
                     if retry_raw:
@@ -987,7 +1111,7 @@ def translate_with_local_model(
                 if tgt == "ru":
                     t = apply_post_pipeline_ru(t)
 
-                # если остался грузинский — fallback на перевод raw
+                # если остался грузинский — ещё один fallback (перевод raw)
                 if src == "ka" and tgt != "ka" and _has_ka(t):
                     repaired = _translate_texts([raw_p])[0] if raw_p else ""
                     if repaired and not _has_ka(repaired):
@@ -1015,7 +1139,7 @@ def translate_with_local_model(
 
 
 # =============================================================================
-# Qwen post-edit (опционально)
+# Qwen post-edit (опционально) — локальная вычитка
 # =============================================================================
 
 def _load_qwen_tokenizer_and_model(model_name: str, device: torch.device):
@@ -1070,7 +1194,8 @@ def qwen_postedit_prompt_ru() -> str:
         "3) Keep proper names unchanged: 'ТЭЛМИКО' and 'Теласи' (do NOT decline).\n"
         "4) Fix MT artifacts: 'единый счет казино' -> 'единый казначейский счет', "
         "'пергасаточка/пергазмаплата' -> 'неустойка', digit+(words) must match.\n"
-        "5) Output ONLY the improved text. No explanations. No markdown.\n"
+        "5) Fix typical legal formula about language of contract; keep it standard and correct.\n"
+        "6) Output ONLY the improved text. No explanations. No markdown.\n"
     )
 
 
@@ -1080,7 +1205,7 @@ def _qwen_postedit_should_run(text: str) -> bool:
     if _has_ka(text):
         return True
     low = text.lower()
-    bad = ["казино", "пергасат", "пергазмаплат", "департамент обороны", "r/n", "стороne"]
+    bad = ["казино", "пергасат", "пергазмаплат", "департамент обороны", "r/n", "стороne", "договорпредстав"]
     if any(x in low for x in bad):
         return True
     if _RE_JUNK_BIBLE.search(text):
@@ -1197,7 +1322,7 @@ def post_edit_with_qwen_local(
 
 
 # =============================================================================
-# ChatGPT перевод + постредактура (сохранено как было)
+# ChatGPT перевод + постредактура (макс качество облака)
 # =============================================================================
 
 def translate_with_chatgpt(
@@ -1239,6 +1364,12 @@ def translate_with_chatgpt(
         "You are a professional legal and technical translator.\n"
         f"Translate from Georgian to {target_language} into natural, formal, human-quality language.\n"
         "Preserve all facts, numbers, names, codes, bank details.\n"
+        "CRITICAL FIXES:\n"
+        "- Translate „დამკვეთი“ as 'Заказчик' (or equivalent in target language).\n"
+        "- Translate company name „თბილისის ელექტრომიმწოდებელი კომპანია“ as "
+        "'Тбилисская электроснабжающая компания' in Russian.\n"
+        "- Avoid typos like 'Стбилисская'.\n"
+        "- If you see 'Договор ... язык' clause, use standard legal wording.\n"
         "Proper names: TELMICO and Telasi must be kept as proper names. "
         "In Russian use exactly 'ТЭЛМИКО' and 'Теласи' and NEVER decline them.\n"
         "Return ONLY JSON: {\"translations\": [{\"id\":..., \"text\":...}, ...]}.\n"
@@ -1334,6 +1465,7 @@ def post_edit_with_chatgpt(
         "Do NOT invent content. Keep numbers and bank details unchanged.\n"
         "Keep proper names unchanged: Russian 'ТЭЛМИКО' and 'Теласи' (never decline).\n"
         "Fix MT artifacts: casino->treasury, nonsense legal terms->standard, digit+(words) must match.\n"
+        "Fix 'contract language' clause into standard legal Russian if present.\n"
         "Return ONLY JSON mapping: {\"<original>\": \"<improved>\", ...}.\n"
     )
 
@@ -1495,13 +1627,15 @@ def process_file(
             clean = str(it["clean_text"])
             item_id = str(it["id"])
             translated = mapping_text_to_trans.get(clean, clean)
+            if target_language.lower() == "russian":
+                translated = apply_post_pipeline_ru(translated)
             id_mapping[item_id] = translated
         apply_translations_docx(file_path, output_path, id_mapping, progress_callback, 90.0, 100.0)
         debug_scan_docx_for_georgian(output_path)
 
     elif is_xlsx(file_path):
         assert xlsx_items is not None
-        id_mapping: Dict[str, str] = {}
+        id_mapping = {}
         for it in xlsx_items:
             clean = str(it["clean_text"])
             item_id = str(it["id"])
@@ -1513,7 +1647,7 @@ def process_file(
 
     else:
         assert pptx_items is not None
-        id_mapping: Dict[str, str] = {}
+        id_mapping = {}
         for it in pptx_items:
             clean = str(it["clean_text"])
             item_id = str(it["id"])
@@ -1522,6 +1656,7 @@ def process_file(
                 translated = apply_post_pipeline_ru(translated)
             id_mapping[item_id] = translated
         apply_translations_pptx_paragraphs(file_path, output_path, id_mapping, progress_callback, 90.0, 100.0)
+        debug_scan_pptx_for_georgian(output_path)
 
     progress_callback(100.0, "Готово.")
     return output_path
